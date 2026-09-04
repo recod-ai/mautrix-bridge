@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""
+bridgectl — gerenciador de pontes mautrix rodando localmente.
+
+- Baixa/atualiza os binários Go pré-compilados (GitHub releases ou CI do mau.dev).
+- Mantém os segredos no chaveiro do Linux (python-keyring).
+- Renderiza config.yaml/registration.yaml em tmpfs na hora de subir a ponte.
+- Um único systemd --user template serve todas as pontes: mautrix-bridge@discord etc.
+
+Requer Python 3.11+ (tomllib) e o pacote `keyring`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+APP = "mautrix-bridges"
+UA = "bridgectl/1.0 (+https://docs.mau.fi/bridges/)"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP
+BIN_DIR = DATA_DIR / "bin"
+
+PLACEHOLDER = re.compile(r"\$\{keyring:([^}]+)\}")
+
+ARCH_MAP = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "armv7l": "arm",
+    "armv6l": "arm",
+}
+
+
+# --------------------------------------------------------------------------- #
+# utilidades
+# --------------------------------------------------------------------------- #
+
+def log(msg: str) -> None:
+    print(f"[bridgectl] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[bridgectl] ERRO: {msg}", file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def http_json(url: str, timeout: int = 15) -> Any:
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and "api.github.com" in url:
+        # Sem token o limite é 60 req/h por IP — fácil de estourar com várias
+        # pontes + cooldown baixo. Com token (mesmo sem escopo nenhum) sobe pra 5000/h.
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def runtime_dir(name: str) -> Path:
+    """Diretório em tmpfs onde os arquivos com segredo são materializados."""
+    env = os.environ.get("RUNTIME_DIRECTORY")  # setado pelo systemd (RuntimeDirectory=)
+    if env:
+        return Path(env.split(":")[0])
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    d = Path(base) / f"mautrix-{name}" if base else Path("/dev/shm") / f"mautrix-{name}-{os.getuid()}"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+# --------------------------------------------------------------------------- #
+# configuração
+# --------------------------------------------------------------------------- #
+
+DEFAULTS = {
+    "channel": "release",       # "release" (GitHub) ou "ci" (mau.dev, branch main)
+    "arch": ARCH_MAP.get(platform.machine(), "amd64"),
+    "keyring_service": "",      # vazio => "mautrix-<nome da ponte>"
+    "update_cooldown": 900,     # segundos entre checagens automáticas
+    "args": [],
+}
+
+
+def load_config() -> dict:
+    path = CONFIG_DIR / "bridges.toml"
+    if not path.exists():
+        die(f"não encontrei {path} — copie o bridges.toml de exemplo para lá")
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    defaults = {**DEFAULTS, **raw.get("defaults", {})}
+    bridges = {}
+    for name, spec in raw.get("bridges", {}).items():
+        merged = {**defaults, **spec}
+        merged.setdefault("repo", name)
+        if not merged.get("keyring_service"):
+            merged["keyring_service"] = f"mautrix-{name}"
+        merged.setdefault("binary", f"mautrix-{name}")
+        merged["name"] = name
+        bridges[name] = merged
+    if not bridges:
+        die("nenhuma ponte declarada em [bridges.*] no bridges.toml")
+    return {"defaults": defaults, "bridges": bridges, "server": raw.get("server", {})}
+
+
+def get_bridge(cfg: dict, name: str) -> dict:
+    if name not in cfg["bridges"]:
+        die(f"ponte '{name}' não está no bridges.toml (tenho: {', '.join(cfg['bridges'])})")
+    return cfg["bridges"][name]
+
+
+def state_path(name: str) -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return STATE_DIR / f"{name}.json"
+
+
+def read_state(name: str) -> dict:
+    p = state_path(name)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def write_state(name: str, data: dict) -> None:
+    state_path(name).write_text(json.dumps(data, indent=2) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# descoberta de versão / download
+# --------------------------------------------------------------------------- #
+
+def latest_release(repo: str, binary: str, arch: str) -> tuple[str, str]:
+    """Última release no GitHub -> (versão, url do asset)."""
+    data = http_json(f"https://api.github.com/repos/mautrix/{repo}/releases/latest")
+    tag = data.get("tag_name") or "unknown"
+    assets = data.get("assets", [])
+
+    def score(asset: dict) -> int:
+        n = asset.get("name", "").lower()
+        if "macos" in n or "darwin" in n or "windows" in n or n.endswith(".sig"):
+            return -1
+        if arch not in n:
+            return -1
+        s = 10
+        if n.startswith(binary):
+            s += 5
+        if "linux" in n:
+            s += 2
+        return s
+
+    best = max(assets, key=score, default=None)
+    if best is None or score(best) < 0:
+        names = ", ".join(a.get("name", "?") for a in assets) or "(nenhum)"
+        raise RuntimeError(f"nenhum asset para arch={arch} na release {tag} de mautrix/{repo}. Assets: {names}")
+    return tag, best["browser_download_url"]
+
+
+def latest_ci(repo: str, binary: str, arch: str) -> tuple[str, str]:
+    """Último pipeline verde do branch main no mau.dev -> (sha curto, url do artefato)."""
+    pipelines = http_json(
+        f"https://mau.dev/api/v4/projects/mautrix%2F{repo}/pipelines"
+        f"?ref=main&status=success&per_page=1"
+    )
+    if not pipelines:
+        raise RuntimeError(f"nenhum pipeline verde em mau.dev/mautrix/{repo} (branch main)")
+    sha = pipelines[0].get("sha", "")[:12] or "unknown"
+    url = (
+        f"https://mau.dev/mautrix/{repo}/-/jobs/artifacts/main/raw/{binary}"
+        f"?job=build%20{arch}"
+    )
+    return f"ci-{sha}", url
+
+
+def download(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
+        shutil.copyfileobj(resp, out, length=1 << 20)
+
+    # Sanidade: CI expirado / redirect de login devolve HTML, não um ELF.
+    with tmp.open("rb") as f:
+        magic = f.read(4)
+    size = tmp.stat().st_size
+    if magic != b"\x7fELF" or size < 1_000_000:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"download não parece um binário Linux (magic={magic!r}, {size} bytes) — url: {url}")
+
+    tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    os.replace(tmp, dest)  # atômico; se a ponte antiga estiver rodando, ela segue no inode antigo
+
+
+def cmd_update(cfg: dict, args: argparse.Namespace) -> int:
+    names = list(cfg["bridges"]) if args.all else [args.name]
+    rc = 0
+    for name in names:
+        b = get_bridge(cfg, name)
+        st = read_state(name)
+        target = BIN_DIR / b["binary"]
+
+        if not args.force and target.exists():
+            elapsed = time.time() - st.get("checked_at", 0)
+            if elapsed < b["update_cooldown"]:
+                if not args.quiet:
+                    log(f"{name}: checado há {int(elapsed)}s, pulando (cooldown {b['update_cooldown']}s)")
+                continue
+
+        try:
+            if b["channel"] == "ci":
+                version, url = latest_ci(b["repo"], b["binary"], b["arch"])
+            else:
+                version, url = latest_release(b["repo"], b["binary"], b["arch"])
+        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+            # Offline ou CI fora do ar não pode impedir a ponte de subir com o binário atual.
+            log(f"{name}: não consegui checar atualizações ({e})")
+            if not target.exists():
+                rc = 1
+            continue
+
+        st["checked_at"] = time.time()
+
+        if target.exists() and st.get("version") == version and not args.force:
+            if not args.quiet:
+                log(f"{name}: já está em {version}")
+            write_state(name, st)
+            continue
+
+        log(f"{name}: baixando {version} ({b['arch']}, canal {b['channel']})")
+        try:
+            download(url, target)
+        except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
+            log(f"{name}: download falhou ({e})")
+            write_state(name, st)
+            if not target.exists():
+                rc = 1
+            continue
+
+        st.update({"version": version, "url": url, "sha256": sha256_file(target),
+                   "installed_at": time.time(), "arch": b["arch"], "channel": b["channel"]})
+        write_state(name, st)
+        log(f"{name}: instalado {version} em {target}")
+    return rc
+
+
+# --------------------------------------------------------------------------- #
+# segredos
+# --------------------------------------------------------------------------- #
+
+def keyring_mod():
+    try:
+        import keyring  # noqa: PLC0415
+    except ImportError:
+        die("pacote 'keyring' não instalado (pacman -S python-keyring / pip install keyring)")
+    return keyring
+
+
+def resolve_secret(ref: str, default_service: str) -> str | None:
+    service, _, key = ref.rpartition("/")
+    return keyring_mod().get_password(service or default_service, key)
+
+
+def render(text: str, name: str, default_service: str) -> str:
+    missing: list[str] = []
+
+    def sub(m: re.Match) -> str:
+        ref = m.group(1)
+        val = resolve_secret(ref, default_service)
+        if val is None:
+            missing.append(ref)
+            return ""
+        return val
+
+    out = PLACEHOLDER.sub(sub, text)
+    if missing:
+        die(f"{name}: segredos ausentes no chaveiro: {', '.join(sorted(set(missing)))}\n"
+            f"           use: bridgectl set {name} <chave>")
+    return out
+
+
+def cmd_set(cfg: dict, args: argparse.Namespace) -> int:
+    import getpass
+    b = get_bridge(cfg, args.name)
+    service = args.service or b["keyring_service"]
+    value = args.value or getpass.getpass(f"valor para {service}/{args.key}: ")
+    if not value:
+        die("valor vazio")
+    keyring_mod().set_password(service, args.key, value)
+    log(f"gravado {service}/{args.key} no chaveiro")
+    return 0
+
+
+HARVEST_KEYS = [
+    "as_token", "hs_token", "login_shared_secret", "shared_secret",
+    "uri", "pickle_key", "provisioning_shared_secret",
+]
+
+
+def cmd_harvest(cfg: dict, args: argparse.Namespace) -> int:
+    """Tira segredos de um config/registration já pronto e põe no chaveiro, deixando placeholders."""
+    b = get_bridge(cfg, args.name)
+    service = b["keyring_service"]
+    path = Path(args.file)
+    if not path.exists():
+        die(f"{path} não existe")
+
+    keys = args.keys.split(",") if args.keys else HARVEST_KEYS
+    kr = keyring_mod()
+    out_lines, moved = [], []
+
+    for line in path.read_text().splitlines():
+        m = re.match(r"^(\s*)([A-Za-z0-9_]+):\s*(.+?)\s*$", line)
+        if m and m.group(2) in keys:
+            indent, key, raw = m.groups()
+            if raw.startswith("${keyring:") or raw in {"null", "~", '""', "''"}:
+                out_lines.append(line)
+                continue
+            value = raw.strip('"').strip("'")
+            kname = f"{args.name}_{key}" if args.prefix else key
+            kr.set_password(service, kname, value)
+            out_lines.append(f'{indent}{key}: "${{keyring:{kname}}}"')
+            moved.append(f"{service}/{kname}")
+        else:
+            out_lines.append(line)
+
+    if not moved:
+        log("nada para mover (nenhuma chave conhecida com valor literal)")
+        return 0
+
+    backup = path.with_suffix(path.suffix + ".orig")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+        os.chmod(backup, 0o600)
+    path.write_text("\n".join(out_lines) + "\n")
+    os.chmod(path, 0o600)
+    log(f"movidos para o chaveiro: {', '.join(moved)}")
+    log(f"cópia original (ainda com segredos!) em {backup} — apague depois de conferir")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# execução
+# --------------------------------------------------------------------------- #
+
+def wait_for_keyring(service: str, probe: str, timeout: int) -> None:
+    """O chaveiro do GNOME/KDE só abre depois do login gráfico; espera em vez de morrer."""
+    if timeout <= 0:
+        return
+    kr = keyring_mod()
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if kr.get_password(service, probe) is not None:
+                return
+        except Exception as e:  # cofre trancado, D-Bus ainda não subiu, etc.
+            last = e
+        else:
+            last = None
+        if time.time() >= deadline:
+            if last:
+                die(f"chaveiro indisponível após {timeout}s: {last}")
+            return
+        time.sleep(3)
+
+
+def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
+    b = get_bridge(cfg, args.name)
+    binary = BIN_DIR / b["binary"]
+    if not binary.exists():
+        die(f"binário {binary} não existe — rode: bridgectl update {args.name} --force")
+
+    src_dir = CONFIG_DIR / args.name
+    cfg_src = src_dir / "config.yaml"
+    reg_src = src_dir / "registration.yaml"
+    if not cfg_src.exists():
+        die(f"{cfg_src} não existe — rode 'bridgectl setup {args.name}'")
+
+    probe = b.get("keyring_probe")
+    if probe:
+        wait_for_keyring(b["keyring_service"], probe, int(b.get("keyring_wait", 120)))
+
+    rd = runtime_dir(args.name)
+    cfg_dst = rd / "config.yaml"
+    cfg_dst.write_text(render(cfg_src.read_text(), args.name, b["keyring_service"]))
+    os.chmod(cfg_dst, 0o600)
+
+    argv = [str(binary), "-c", str(cfg_dst)]
+    if reg_src.exists():
+        reg_dst = rd / "registration.yaml"
+        reg_dst.write_text(render(reg_src.read_text(), args.name, b["keyring_service"]))
+        os.chmod(reg_dst, 0o600)
+        argv += ["-r", str(reg_dst)]
+    argv += list(b.get("args", [])) + list(args.extra)
+
+    workdir = Path(b.get("workdir") or (DATA_DIR / args.name))
+    workdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(workdir, 0o700)  # o banco da ponte (sessão do Slack/Discord) mora aqui
+    os.chdir(workdir)
+
+    log(f"exec {b['binary']} ({read_state(args.name).get('version', '?')}) — config em {cfg_dst}")
+    os.execv(argv[0], argv)  # substitui o processo: o systemd passa a supervisionar a ponte
+
+
+def cmd_bootstrap(cfg: dict, args: argparse.Namespace) -> int:
+    """Gera config/registration de exemplo no diretório da ponte, para você editar."""
+    b = get_bridge(cfg, args.name)
+    binary = BIN_DIR / b["binary"]
+    if not binary.exists():
+        die(f"binário {binary} não existe — rode antes: bridgectl update {args.name} --force")
+    dst = CONFIG_DIR / args.name
+    dst.mkdir(parents=True, exist_ok=True)
+    cfg_file = dst / "config.yaml"
+    if cfg_file.exists() and not args.force:
+        die(f"{cfg_file} já existe (use --force para sobrescrever)")
+
+    import subprocess
+    r = subprocess.run([str(binary), "-e", "-c", str(cfg_file)], capture_output=True, text=True)
+    if r.returncode != 0 or not cfg_file.exists():
+        log(f"'{b['binary']} -e' não funcionou (pontes legadas, como discord, não têm essa flag).")
+        log(f"Pegue o example-config.yaml de https://github.com/mautrix/{b['repo']} "
+            f"e salve como {cfg_file}")
+        if r.stderr.strip():
+            log(r.stderr.strip().splitlines()[-1])
+        return 1
+    os.chmod(cfg_file, 0o600)
+    log(f"config de exemplo em {cfg_file}")
+    if not getattr(args, "quiet_hint", False):
+        log("edite os campos do servidor à mão, ou rode:")
+        log(f"  bridgectl setup {args.name}   # preenche o servidor, gera o registration e harvesta sozinho")
+    return 0
+
+
+MXID_RE = re.compile(r"^@([^:]+):(.+)$")
+
+
+def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
+    """Pergunta os dados do servidor uma única vez e grava em [server] no bridges.toml."""
+    print("Configuração do servidor (usada por 'bridgectl setup' em todas as pontes)\n")
+    domain = input("Domínio do seu Synapse (server_name, ex: matrix.exemplo.com): ").strip()
+    if not domain:
+        die("domínio é obrigatório")
+
+    default_address = "http://10.10.0.1:8008"  # convenção do WireGuard descrita no README/SERVIDOR.md
+    address = input(
+        f"Endereço que a ponte usa pra falar com o Synapse [{default_address}]: "
+    ).strip() or default_address
+
+    owner = input(
+        "Seu Matrix ID (dono das suas pontes — ganha o nível de permissão "
+        "'admin' *dentro* de cada ponte, sem relação com ser admin do Synapse; "
+        "ex: @voce:matrix.exemplo.com, deixe em branco pra pular): "
+    ).strip()
+
+    if owner:
+        m = MXID_RE.match(owner)
+        if not m:
+            die(f"'{owner}' não parece um Matrix ID válido (formato esperado: @usuario:{domain})")
+        owner_domain = m.group(2)
+        if owner_domain != domain:
+            log(f"AVISO: '{owner}' é do domínio '{owner_domain}', diferente do servidor que "
+                f"você configurou ('{domain}'). Esse Matrix ID vai virar o dono de todas as "
+                f"pontes que você configurar a partir de agora — confira que é mesmo a sua conta.")
+            if input("Confirma mesmo assim? [s/N]: ").strip().lower() not in ("s", "sim", "y", "yes"):
+                die("cancelado — rode 'bridgectl init' de novo com o Matrix ID correto")
+
+    print("\nConfira antes de gravar:")
+    print(f"  domínio do Synapse:  {domain}")
+    print(f"  endereço da ponte:   {address}")
+    print(f"  dono das pontes:     {owner or '(nenhum)'}")
+    if input("Gravar em bridges.toml? [S/n]: ").strip().lower() not in ("", "s", "sim", "y", "yes"):
+        die("cancelado, nada foi gravado")
+
+    path = CONFIG_DIR / "bridges.toml"
+    text = path.read_text() if path.exists() else ""
+    block = f'[server]\nhomeserver_domain = "{domain}"\nhomeserver_address = "{address}"\n'
+    if owner:
+        block += f'owner_mxid = "{owner}"\n'
+
+    if re.search(r"(?m)^\[server\]", text):
+        text = re.sub(r"(?ms)^\[server\].*?(?=^\[|\Z)", block + "\n", text, count=1)
+    else:
+        text = block + "\n" + text
+    path.write_text(text)
+    log(f"servidor salvo em {path}")
+    log("agora rode: bridgectl setup <ponte>  (uma vez por ponte)")
+    return 0
+
+
+def patch_config(cfg_file: Path, server: dict) -> None:
+    """Preenche homeserver.address/domain e bridge.permissions no lugar dos placeholders
+    de exemplo (example.com / example.localhost:8008), quando ainda estão intocados.
+    Pontes legadas (sem esse template) ou configs já editados à mão são deixados em paz."""
+    domain = server.get("homeserver_domain")
+    address = server.get("homeserver_address")
+    owner = server.get("owner_mxid")
+    if not domain or not address:
+        return
+
+    text = cfg_file.read_text()
+    before = text
+
+    text = re.sub(
+        r"^(\s*)address: http://example\.localhost:8008\s*$",
+        rf"\1address: {address}", text, count=1, flags=re.M,
+    )
+    text = re.sub(
+        r"^(\s*)domain: example\.com\s*$",
+        rf"\1domain: {domain}", text, count=1, flags=re.M,
+    )
+    text = text.replace('"example.com": user', f'"{domain}": user')
+    if owner:
+        text = text.replace('"@admin:example.com": admin', f'"{owner}": admin')
+
+    if text == before:
+        log(f"{cfg_file.name}: não encontrei os placeholders de exemplo (example.com/example.localhost) "
+            f"— confira homeserver.address/domain e bridge.permissions à mão")
+        return
+    cfg_file.write_text(text)
+    log(f"{cfg_file.name}: homeserver.address/domain e bridge.permissions preenchidos")
+
+
+def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
+    """Um comando só: baixa o binário, gera config+registration, preenche os dados do
+    servidor e move os segredos pro chaveiro. Ao final só falta copiar o registration
+    pro Synapse e ativar o systemd."""
+    b = get_bridge(cfg, args.name)
+    server = cfg.get("server", {})
+    if not server.get("homeserver_domain") or not server.get("homeserver_address"):
+        die("rode 'bridgectl init' primeiro (dados do servidor ainda não configurados)")
+
+    binary = BIN_DIR / b["binary"]
+    if not binary.exists():
+        cmd_update(cfg, argparse.Namespace(name=args.name, all=False, force=True, quiet=False))
+
+    dst = CONFIG_DIR / args.name
+    cfg_file = dst / "config.yaml"
+    reg_file = dst / "registration.yaml"
+
+    if not cfg_file.exists():
+        rc = cmd_bootstrap(cfg, argparse.Namespace(name=args.name, force=False, quiet_hint=True))
+        if rc != 0:
+            die(f"{args.name}: gere {cfg_file} manualmente (ver mensagem acima) e rode 'bridgectl setup {args.name}' de novo")
+    else:
+        log(f"{args.name}: config já existe, mantido")
+
+    patch_config(cfg_file, server)
+
+    if not reg_file.exists():
+        import subprocess
+        r = subprocess.run(
+            [str(binary), "-c", str(cfg_file), "-r", str(reg_file), "-g"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0 or not reg_file.exists():
+            if r.stderr.strip():
+                log(r.stderr.strip().splitlines()[-1])
+            die(f"{args.name}: não consegui gerar {reg_file} — ajuste {cfg_file} "
+                f"(domínio/porta/permissions) e rode 'bridgectl setup {args.name}' de novo")
+        os.chmod(reg_file, 0o600)
+        log(f"{args.name}: registration.yaml gerado")
+    else:
+        log(f"{args.name}: registration.yaml já existe, mantido")
+
+    cmd_harvest(cfg, argparse.Namespace(name=args.name, file=str(cfg_file), keys=None, prefix=False))
+    cmd_harvest(cfg, argparse.Namespace(name=args.name, file=str(reg_file), keys=None, prefix=False))
+
+    print()
+    log(f"{args.name}: pronto. Falta:")
+    log(f"  1. copiar {reg_file} pro Synapse (app_service_config_files) e reiniciar o Synapse")
+    log(f"  2. systemctl --user enable --now mautrix-bridge@{args.name}")
+    return 0
+
+
+def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
+    def secrets_ok(b: dict) -> str:
+        probe = b.get("keyring_probe", "as_token")
+        try:
+            return "ok" if resolve_secret(probe, b["keyring_service"]) else "faltando"
+        except Exception:
+            return "?"
+
+    rows = []
+    for name, b in cfg["bridges"].items():
+        st = read_state(name)
+        binary = BIN_DIR / b["binary"]
+        checked = st.get("checked_at")
+        rows.append((
+            name,
+            st.get("version", "-") if binary.exists() else "não instalado",
+            b["channel"],
+            f"{int((time.time() - checked) / 60)} min" if checked else "-",
+            "ok" if (CONFIG_DIR / name / "config.yaml").exists() else "sem config",
+            secrets_ok(b),
+        ))
+    hdr = ("ponte", "versão", "canal", "checado", "config", "segredos")
+    w = [max(len(str(r[i])) for r in [hdr] + rows) for i in range(len(hdr))]
+    print("  ".join(h.ljust(w[i]) for i, h in enumerate(hdr)))
+    print("  ".join("-" * w[i] for i in range(len(hdr))))
+    for r in rows:
+        print("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+    print("\n'segredos: faltando' -> rode 'bridgectl setup <ponte>' antes de ativar o systemd dela.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="bridgectl", description="pontes mautrix com chaveiro + auto-update")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    up = sub.add_parser("update", help="checa e baixa nova versão do binário")
+    up.add_argument("name", nargs="?")
+    up.add_argument("--all", action="store_true")
+    up.add_argument("--force", action="store_true", help="ignora cooldown e reinstala")
+    up.add_argument("--quiet", action="store_true")
+    up.set_defaults(func=cmd_update)
+
+    rn = sub.add_parser("run", help="renderiza segredos em tmpfs e executa a ponte")
+    rn.add_argument("name")
+    rn.add_argument("extra", nargs="*", help="argumentos extras para o binário")
+    rn.set_defaults(func=cmd_run)
+
+    st = sub.add_parser("set", help="grava um segredo no chaveiro")
+    st.add_argument("name")
+    st.add_argument("key")
+    st.add_argument("value", nargs="?")
+    st.add_argument("--service")
+    st.set_defaults(func=cmd_set)
+
+    hv = sub.add_parser("harvest", help="move segredos de um yaml para o chaveiro, deixando placeholders")
+    hv.add_argument("name")
+    hv.add_argument("file")
+    hv.add_argument("--keys", help="lista separada por vírgula (default: as_token,hs_token,uri,...)")
+    hv.add_argument("--prefix", action="store_true", help="prefixa a chave com o nome da ponte")
+    hv.set_defaults(func=cmd_harvest)
+
+    bs = sub.add_parser("bootstrap", help="gera config de exemplo para a ponte")
+    bs.add_argument("name")
+    bs.add_argument("--force", action="store_true")
+    bs.set_defaults(func=cmd_bootstrap)
+
+    sub.add_parser("init", help="pergunta os dados do servidor uma vez (usado por 'setup')").set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("setup", help="baixa, gera config/registration, preenche servidor e harvesta — tudo de uma vez")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_setup)
+
+    sub.add_parser("status", help="mostra versões instaladas").set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    if getattr(args, "func", None) is cmd_update and not args.all and not args.name:
+        die("informe o nome da ponte ou use --all")
+
+    cfg = load_config()
+    return args.func(cfg, args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

@@ -1,0 +1,58 @@
+; ~/.config/systemd/user/mautrix-bridge@.service
+;
+; Um template para todas as pontes:
+;   systemctl --user enable --now mautrix-bridge@slack
+;   systemctl --user enable --now mautrix-bridge@discord
+
+[Unit]
+Description=Ponte mautrix-%i (bridgectl + chaveiro)
+Documentation=https://docs.mau.fi/bridges/go/setup.html
+After=network-online.target graphical-session.target
+Wants=network-online.target
+; O cofre do GNOME/KDE só existe dentro da sessão gráfica; se a sessão cai, a ponte cai junto.
+PartOf=graphical-session.target
+; Sem limite de reinícios: uma ponte offline por horas deve continuar tentando.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+
+; Checa atualização a cada (re)início. O "-" no começo faz o systemd ignorar
+; falha aqui: se o GitHub/mau.dev estiver fora, a ponte sobe com o binário atual.
+ExecStartPre=-%h/.local/bin/bridgectl update %i --quiet
+ExecStart=%h/.local/bin/bridgectl run %i
+
+; /run/user/UID/mautrix-<ponte>, modo 0700, apagado quando o serviço para.
+; É aqui que o config.yaml com os segredos é materializado (tmpfs, nunca no disco).
+RuntimeDirectory=mautrix-%i
+RuntimeDirectoryMode=0700
+
+Restart=always
+RestartSec=15s
+TimeoutStopSec=30s
+
+; O chaveiro precisa do D-Bus da sessão. Normalmente já vem importado no
+; systemd --user; esta linha é um fallback inofensivo.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+
+; Opcional: GITHUB_TOKEN=ghp_... (sem escopo nenhum já basta) sobe o limite da
+; API do GitHub de 60 para 5000 req/h. Arquivo "chave=valor por linha", 0600,
+; que não existe por padrão -- o "-" faz o systemd seguir sem ele.
+EnvironmentFile=-%h/.config/mautrix-bridges/environment
+
+; Endurecimento leve. Não use ProtectHome=yes: a ponte precisa escrever o banco
+; e os logs em ~/.local/share/mautrix-bridges/.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/mautrix-bridges %h/.local/state/mautrix-bridges
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=graphical-session.target

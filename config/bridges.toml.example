@@ -1,0 +1,52 @@
+# ~/.config/mautrix-bridges/bridges.toml
+#
+# Cada [bridges.X] vira um serviço systemd: mautrix-bridge@X.service
+#
+# Não edite [server] aqui à mão — ele é escrito por "bridgectl init" (domínio
+# do Synapse, endereço da VPN, o Matrix ID do dono das pontes) e usado por
+# "bridgectl setup <ponte>" pra preencher o config de cada ponte sozinho.
+
+[defaults]
+# "release" = GitHub releases (estável)  |  "ci" = último build verde do main no mau.dev
+channel = "release"
+# detectado automaticamente se omitido: amd64 / arm64 / arm
+# arch = "amd64"
+# cada ponte usa por padrão o serviço "mautrix-<nome>" no chaveiro
+# keyring_service = "mautrix-slack"
+# segundos mínimos entre duas checagens de atualização (evita martelar o servidor
+# quando o systemd fica reiniciando a ponte em loop)
+update_cooldown = 900
+# chave usada só para testar se o cofre já está destrancado antes de subir
+keyring_probe = "as_token"
+keyring_wait = 120
+
+
+[bridges.slack]
+repo = "slack"            # github.com/mautrix/slack
+binary = "mautrix-slack"
+
+[bridges.discord]
+repo = "discord"
+binary = "mautrix-discord"
+
+# --- exemplos, descomente conforme for adicionando ---
+
+# [bridges.whatsapp]
+# repo = "whatsapp"
+# binary = "mautrix-whatsapp"
+
+# [bridges.telegram]
+# repo = "telegram"
+# binary = "mautrix-telegram"
+
+# [bridges.signal]
+# repo = "signal"
+# binary = "mautrix-signal"
+# # signal linka libsignal; se a release não tiver binário estático pro seu arch,
+# # troque para channel = "ci"
+
+# # mautrix-meta cobre Messenger e Instagram: repo e binário têm nomes diferentes
+# [bridges.instagram]
+# repo = "meta"
+# binary = "mautrix-meta"
+# args = ["--no-update"]  # flags extras passadas ao binário, se precisar
