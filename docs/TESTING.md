@@ -76,21 +76,25 @@ pode ficar em branco):
 
 ```
 Domínio do seu Synapse: meu-servidor.exemplo
-Endereço que a ponte usa pra falar com o Synapse [http://10.10.0.1:8008]: http://localhost:8008
+Endereço público do Synapse (HTTPS, o mesmo que seu Element usa) [https://matrix.meu-servidor.exemplo]: http://localhost:8008
+Seu IP nesta VPN WireGuard (o administrador te deu, ex: 10.10.0.2): 10.10.0.2
 Seu Matrix ID (dono das suas pontes — ganha o nível de permissão 'admin' *dentro*
 de cada ponte, sem relação com ser admin do Synapse; ...): @dono:meu-servidor.exemplo
 
 Confira antes de gravar:
-  domínio do Synapse:  meu-servidor.exemplo
-  endereço da ponte:   http://localhost:8008
-  dono das pontes:     @dono:meu-servidor.exemplo
+  domínio do Synapse:      meu-servidor.exemplo
+  endereço do Synapse:     http://localhost:8008
+  seu IP na VPN:           10.10.0.2
+  dono das pontes:         @dono:meu-servidor.exemplo
 Gravar em bridges.toml? [S/n]: 
 ```
 
-O endereço já vem com o padrão `http://10.10.0.1:8008` sugerido entre colchetes
-(a convenção do WireGuard usada no README/SERVIDOR.md) — pra este teste local,
-sem VPN nenhuma de verdade, sobrescreva com `http://localhost:8008` como no
-exemplo acima. Apertar Enter sem digitar nada aceita o valor sugerido.
+O endereço do Synapse já vem com o padrão `https://matrix.<domínio>` sugerido
+entre colchetes — pra este teste local, sem servidor de verdade, sobrescreva
+com `http://localhost:8008` como no exemplo acima. O IP da VPN não tem
+default (é único por pessoa); para este teste local sem VPN de verdade, use
+qualquer IP válido (ex: `10.10.0.2`) — só não pode ficar em branco.
+Apertar Enter sem digitar nada aceita o valor sugerido, quando existe um.
 
 O `init` valida o Matrix ID do dono da ponte (formato `@usuario:domínio`) e avisa se o
 domínio dele for diferente do que você configurou como servidor — pensado
@@ -102,7 +106,7 @@ de confirmação antes de apertar Enter.
 Confira que gravou em `~/.config/mautrix-bridges/bridges.toml`:
 
 ```bash
-grep -A3 "\[server\]" ~/.config/mautrix-bridges/bridges.toml
+grep -A4 "\[server\]" ~/.config/mautrix-bridges/bridges.toml
 ```
 
 ## 4. Configurar a ponte com um comando só
@@ -112,24 +116,25 @@ bridgectl setup slack
 ```
 
 Isso faz tudo de uma vez: gera `config.yaml` (via `mautrix-slack -e`),
-substitui `homeserver.address`/`domain` e `bridge.permissions` pelos valores
-do passo 3, roda `-g` pra gerar `registration.yaml`, e move os segredos pro
-chaveiro. Esperado, nessa ordem:
+substitui `homeserver.address`/`domain`, `appservice.address`/`hostname` e
+`bridge.permissions` pelos valores do passo 3, roda `-g` pra gerar
+`registration.yaml`, e move os segredos pro chaveiro. Esperado, nessa ordem:
 
 ```
 [bridgectl] config de exemplo em .../slack/config.yaml
-[bridgectl] config.yaml: homeserver.address/domain e bridge.permissions preenchidos
+[bridgectl] config.yaml: homeserver.address/domain, appservice.address/hostname e bridge.permissions preenchidos
 [bridgectl] slack: registration.yaml gerado
 [bridgectl] movidos para o chaveiro: mautrix-slack/uri, mautrix-slack/as_token, ...
 [bridgectl] movidos para o chaveiro: mautrix-slack/as_token, mautrix-slack/hs_token
 [bridgectl] slack: pronto. Falta: ...
 ```
 
-Confira que os placeholders realmente foram trocados e que sobrou só
-`${keyring:...}` nos segredos:
+Confira que os placeholders realmente foram trocados — `homeserver.address`
+deve ser a URL pública, `appservice.address`/`hostname` devem ser o IP da VPN
+(passo 3), e só deve sobrar `${keyring:...}` nos segredos:
 
 ```bash
-grep -E "address: http|^\s*domain:|as_token:|hs_token:" ~/.config/mautrix-bridges/slack/config.yaml
+grep -E "address: http|^\s*domain:|^\s*hostname:|as_token:|hs_token:" ~/.config/mautrix-bridges/slack/config.yaml
 ```
 
 E que o valor real está mesmo no chaveiro:
@@ -245,9 +250,10 @@ fim: WireGuard entre as duas máquinas e o registro do `registration.yaml` no
 `homeserver.yaml`. Sem isso, tudo o resto funciona e a ponte simplesmente
 nunca recebe eventos — o Synapse não tem como alcançá-la.
 
-Se você já apagou o `.orig` do passo 4 sem copiar o `registration.yaml`, gere
-de novo: apague `~/.config/mautrix-bridges/slack/registration.yaml` e rode
-`bridgectl setup slack` de novo antes de repetir o harvest.
+Pra pegar o `registration.yaml` com os valores reais (o que fica em
+`~/.config/mautrix-bridges/slack/` só tem placeholder do chaveiro, o Synapse
+não entende isso), use `bridgectl reveal slack --out arquivo.yaml` — não
+precisa do `.orig`, ele lê do chaveiro direto.
 
 Depois que o Synapse carregar o appservice sem erro, convide o bot da ponte
 (`@slackbot:seu-dominio`) numa sala e siga o fluxo de login descrito na doc
@@ -258,8 +264,14 @@ oficial da ponte.
 `mautrix-discord` não tem a flag `-e`. `bridgectl setup discord` vai baixar o
 binário, tentar o `-e` e avisar que não achou — te aponta para o
 `example-config.yaml` do repo no GitHub. Baixe manualmente, salve como
-`~/.config/mautrix-bridges/discord/config.yaml`, edite `homeserver`/`domain`/
-`bridge.permissions` à mão (o `setup` não sabe achar os placeholders num
-arquivo com formato diferente) e rode `bridgectl setup discord` de novo — ele
-percebe que o config já existe, pula o bootstrap e completa `-g` + harvest.
-Fora esse detalhe, o resto do fluxo (run, systemd, auto-update) é idêntico.
+`~/.config/mautrix-bridges/discord/config.yaml`, edite à mão (o `setup` não
+sabe achar os placeholders num arquivo com formato diferente):
+
+- `homeserver.address`/`domain` e `bridge.permissions`, como sempre;
+- **`appservice.address`/`hostname`: coloque seu IP da VPN, não `localhost`**
+  — esse é o passo que mais gente esquece numa ponte legada, e o sintoma é a
+  ponte subir normalmente mas nunca receber nada do Synapse.
+
+Depois rode `bridgectl setup discord` de novo — ele percebe que o config já
+existe, pula o bootstrap e completa `-g` + harvest. Fora esse detalhe, o
+resto do fluxo (run, systemd, auto-update) é idêntico.

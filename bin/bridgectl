@@ -427,6 +427,30 @@ def cmd_run(cfg: dict, args: argparse.Namespace) -> int:
     os.execv(argv[0], argv)  # substitui o processo: o systemd passa a supervisionar a ponte
 
 
+def cmd_reveal(cfg: dict, args: argparse.Namespace) -> int:
+    """Renderiza o registration.yaml de volta com os valores reais do chaveiro.
+
+    O registration.yaml em ~/.config fica com placeholders (harvest trata ele
+    igual ao config.yaml, pra nunca sobrar segredo em texto puro em disco) —
+    mas o Synapse não entende ${keyring:...}, ele só lê o YAML literal. Esse
+    comando existe só pra gerar, na hora, a cópia de verdade que vai pro
+    administrador; não deixe essa saída sobrando em disco depois de enviada."""
+    b = get_bridge(cfg, args.name)
+    path = CONFIG_DIR / args.name / "registration.yaml"
+    if not path.exists():
+        die(f"{path} não existe — rode 'bridgectl setup {args.name}' primeiro")
+    text = render(path.read_text(), args.name, b["keyring_service"])
+    if args.out:
+        out = Path(args.out)
+        out.write_text(text)
+        os.chmod(out, 0o600)
+        log(f"registration.yaml (valores reais) escrito em {out} — "
+            f"apague depois de enviar pro administrador")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def cmd_bootstrap(cfg: dict, args: argparse.Namespace) -> int:
     """Gera config/registration de exemplo no diretório da ponte, para você editar."""
     b = get_bridge(cfg, args.name)
@@ -466,10 +490,24 @@ def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
     if not domain:
         die("domínio é obrigatório")
 
-    default_address = "http://10.10.0.1:8008"  # convenção do WireGuard descrita no README/SERVIDOR.md
+    # Esse é o endereço que A PONTE usa pra falar com o Synapse (saída) — é tráfego
+    # normal de cliente HTTPS, não precisa de VPN pra isso, mesmo a ponte rodando
+    # em outra máquina. Convenção comum: subdomínio "matrix." do domínio do servidor.
+    default_address = f"https://matrix.{domain}"
     address = input(
-        f"Endereço que a ponte usa pra falar com o Synapse [{default_address}]: "
+        f"Endereço público do Synapse (HTTPS, o mesmo que seu Element usa) [{default_address}]: "
     ).strip() or default_address
+
+    # Esse já é o sentido contrário: o Synapse chamando DE VOLTA a ponte (webhook do
+    # appservice) — like a ponte roda atrás de NAT, só chega até ela pela VPN. É por
+    # isso que existe um campo separado do endereço acima.
+    vpn_ip = input(
+        "Seu IP nesta VPN WireGuard (o administrador te deu, ex: 10.10.0.2): "
+    ).strip()
+    if not vpn_ip:
+        die("IP na VPN é obrigatório — sem ele o Synapse não consegue chamar sua ponte de volta")
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", vpn_ip):
+        die(f"'{vpn_ip}' não parece um IPv4 (ex: 10.10.0.2)")
 
     owner = input(
         "Seu Matrix ID (dono das suas pontes — ganha o nível de permissão "
@@ -490,15 +528,19 @@ def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
                 die("cancelado — rode 'bridgectl init' de novo com o Matrix ID correto")
 
     print("\nConfira antes de gravar:")
-    print(f"  domínio do Synapse:  {domain}")
-    print(f"  endereço da ponte:   {address}")
-    print(f"  dono das pontes:     {owner or '(nenhum)'}")
+    print(f"  domínio do Synapse:      {domain}")
+    print(f"  endereço do Synapse:     {address}")
+    print(f"  seu IP na VPN:           {vpn_ip}")
+    print(f"  dono das pontes:         {owner or '(nenhum)'}")
     if input("Gravar em bridges.toml? [S/n]: ").strip().lower() not in ("", "s", "sim", "y", "yes"):
         die("cancelado, nada foi gravado")
 
     path = CONFIG_DIR / "bridges.toml"
     text = path.read_text() if path.exists() else ""
-    block = f'[server]\nhomeserver_domain = "{domain}"\nhomeserver_address = "{address}"\n'
+    block = (
+        f'[server]\nhomeserver_domain = "{domain}"\nhomeserver_address = "{address}"\n'
+        f'vpn_ip = "{vpn_ip}"\n'
+    )
     if owner:
         block += f'owner_mxid = "{owner}"\n'
 
@@ -513,11 +555,18 @@ def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
 
 
 def patch_config(cfg_file: Path, server: dict) -> None:
-    """Preenche homeserver.address/domain e bridge.permissions no lugar dos placeholders
-    de exemplo (example.com / example.localhost:8008), quando ainda estão intocados.
-    Pontes legadas (sem esse template) ou configs já editados à mão são deixados em paz."""
+    """Preenche homeserver.address/domain, appservice.address/hostname e bridge.permissions
+    no lugar dos placeholders de exemplo, quando ainda estão intocados. Pontes legadas (sem
+    esse template) ou configs já editados à mão são deixados em paz.
+
+    homeserver.address e appservice.address são direções opostas: a primeira é a ponte
+    chamando o Synapse (tráfego de saída normal, funciona com a URL pública HTTPS); a
+    segunda é o Synapse chamando de volta a ponte (só chega via VPN, por isso usa o IP
+    WireGuard). appservice.hostname também vira o IP da VPN, pra ponte só escutar ali
+    em vez de todas as interfaces."""
     domain = server.get("homeserver_domain")
     address = server.get("homeserver_address")
+    vpn_ip = server.get("vpn_ip")
     owner = server.get("owner_mxid")
     if not domain or not address:
         return
@@ -537,12 +586,27 @@ def patch_config(cfg_file: Path, server: dict) -> None:
     if owner:
         text = text.replace('"@admin:example.com": admin', f'"{owner}": admin')
 
+    if vpn_ip:
+        text = re.sub(
+            r"^(\s*)address: http://localhost:(\d+)\s*$",
+            rf"\1address: http://{vpn_ip}:\2", text, count=1, flags=re.M,
+        )
+        text = re.sub(
+            r"^(\s*)hostname: 127\.0\.0\.1\s*$",
+            rf"\1hostname: {vpn_ip}", text, count=1, flags=re.M,
+        )
+    else:
+        log(f"{cfg_file.name}: sem vpn_ip em [server] (rode 'bridgectl init' de novo) — "
+            f"appservice.address/hostname continuam em localhost, o Synapse não vai "
+            f"conseguir chamar a ponte de volta")
+
     if text == before:
         log(f"{cfg_file.name}: não encontrei os placeholders de exemplo (example.com/example.localhost) "
             f"— confira homeserver.address/domain e bridge.permissions à mão")
         return
     cfg_file.write_text(text)
-    log(f"{cfg_file.name}: homeserver.address/domain e bridge.permissions preenchidos")
+    log(f"{cfg_file.name}: homeserver.address/domain, appservice.address/hostname e "
+        f"bridge.permissions preenchidos")
 
 
 def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
@@ -592,7 +656,8 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
 
     print()
     log(f"{args.name}: pronto. Falta:")
-    log(f"  1. copiar {reg_file} pro Synapse (app_service_config_files) e reiniciar o Synapse")
+    log(f"  1. 'bridgectl reveal {args.name}' pra pegar o registration.yaml com valores reais "
+        f"(o que ficou em {reg_file} tem só placeholder do chaveiro) e mandar pro administrador")
     log(f"  2. systemctl --user enable --now mautrix-bridge@{args.name}")
     return 0
 
@@ -659,6 +724,11 @@ def main() -> int:
     hv.add_argument("--keys", help="lista separada por vírgula (default: as_token,hs_token,uri,...)")
     hv.add_argument("--prefix", action="store_true", help="prefixa a chave com o nome da ponte")
     hv.set_defaults(func=cmd_harvest)
+
+    rv = sub.add_parser("reveal", help="imprime o registration.yaml com os valores reais (pra mandar pro administrador)")
+    rv.add_argument("name")
+    rv.add_argument("--out", help="escreve num arquivo em vez de stdout (permissão 600)")
+    rv.set_defaults(func=cmd_reveal)
 
     bs = sub.add_parser("bootstrap", help="gera config de exemplo para a ponte")
     bs.add_argument("name")

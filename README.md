@@ -21,10 +21,12 @@ sudo pacman -S python-keyring gnome-keyring wireguard-tools   # Arch; noutras di
 ```bash
 bridgectl init            # uma vez: domínio do Synapse, endereço, seu Matrix ID
 bridgectl setup slack     # baixa o binário, gera config+registration, harvesta os segredos
+bridgectl reveal slack --out registration-para-o-admin.yaml   # com os valores reais
 ```
 
-O `setup` imprime, no final, um `registration.yaml` para copiar para o
-servidor — siga [docs/SERVIDOR.md](docs/SERVIDOR.md) para essa parte. Depois:
+Mande esse `registration-para-o-admin.yaml` para o administrador do servidor
+e apague sua cópia depois — siga [docs/SERVIDOR.md](docs/SERVIDOR.md) para
+essa parte. Depois:
 
 ```bash
 systemctl --user enable --now mautrix-bridge@slack
@@ -72,11 +74,16 @@ prontas pra `systemctl enable`.
 
 ## Conectividade
 
-Appservice é *push*: o Synapse faz POST na URL do `registration.yaml`. Como a
-ponte roda no seu computador atrás de NAT (é assim que o tráfego do
-Discord/Slack/WhatsApp sai com IP residencial, não IP de datacenter), o
-Synapse não alcança essa URL sozinho — a solução é uma **VPN WireGuard** entre
-as duas máquinas.
+Tráfego de appservice tem duas direções, e só uma delas é o problema:
+
+- **Ponte → Synapse** (ler/enviar eventos): saída normal, HTTPS público — sem
+  segredo nenhum, é como qualquer cliente Matrix.
+- **Synapse → ponte** (o POST que entrega eventos, é *push*): o Synapse
+  precisa alcançar a URL do `registration.yaml`. Como a ponte roda no seu
+  computador atrás de NAT (é assim que o tráfego do Discord/Slack/WhatsApp
+  sai com IP residencial, não IP de datacenter), essa direção não funciona
+  sem ajuda — a solução é uma **VPN WireGuard** entre as duas máquinas, só
+  pra essa chamada de volta.
 
 Do lado do servidor: [docs/SERVIDOR.md](docs/SERVIDOR.md). Do seu lado:
 
@@ -102,10 +109,17 @@ PersistentKeepalive = 25
 sudo systemctl enable --now wg-quick@wg0
 ```
 
-Em `bridgectl init`, o "endereço do Synapse" passa a ser `http://10.10.0.1:8008`
-(o IP do servidor na VPN). Sem manutenção depois disso: as chaves não expiram,
-e como é sempre o seu computador que inicia a conexão, trocar de rede/Wi-Fi
-não derruba o túnel.
+Em `bridgectl init` isso vira dois campos diferentes, não um só:
+
+- **"Endereço público do Synapse"**: a URL HTTPS normal (ex:
+  `https://matrix.exemplo.com`) — vira `homeserver.address` no config da
+  ponte. Não tem nada a ver com a VPN.
+- **"Seu IP nesta VPN"** (ex: `10.10.0.2`, o que o administrador te deu):
+  vira `appservice.address`/`appservice.hostname` — é o endereço que o
+  Synapse usa pra chamar sua ponte de volta, e só existe alcançável pela VPN.
+
+Sem manutenção depois disso: as chaves não expiram, e como é sempre o seu
+computador que inicia a conexão, trocar de rede/Wi-Fi não derruba o túnel.
 
 ## Auto-update
 
@@ -125,6 +139,94 @@ A unit do systemd roda `bridgectl update <ponte>` a cada início e reinício:
 
 Para congelar uma ponte, ponha `update_cooldown = 31536000` nela no
 `bridges.toml`.
+
+## Convenção recomendada: marcador, espaço, criptografia e histórico
+
+Testado em produção (set/2026) com Slack, Discord e WhatsApp no mesmo
+Synapse. Se você recriar o servidor do zero, aplique os mesmos ajustes de
+`config.yaml` abaixo em cada ponte — todos retroagem em salas já existentes
+com um simples restart do serviço (confirmado via log: `Updating portal
+name` reaparece pras salas antigas assim que a ponte reinicia).
+
+### Marcador por ponte em "Pessoas"
+
+Use `displayname_template` (não `channel_name_template`) para isso: numa DM
+1:1, o nome da sala **sempre** vem do nome do fantasma — `channel_name_template`
+só vale para canais/grupos, é ignorado numa DM 1:1 mesmo que você edite ele.
+
+| Ponte    | sufixo   | campo                            |
+|----------|----------|-----------------------------------|
+| Slack    | `(SLCK)` | `network.displayname_template`   |
+| Discord  | `(DSRD)` | `bridge.displayname_template`    |
+| WhatsApp | `(WA)`   | já vem assim por padrão, sem editar |
+
+Teams: não incluído ainda — não existe ponte oficial madura (checado em
+set/2026; só existem projetos experimentais fora da organização
+`github.com/mautrix`, incompatíveis com o auto-update do `bridgectl`). O
+sufixo `(TMS)` fica reservado pra quando existir uma ponte confiável.
+
+### Espaço por servidor/workspace
+
+`bridge.personal_filtering_spaces: true` no Slack e no WhatsApp (Discord já
+tem esse comportamento fixo, sem opção pra desligar). Isso cria **um espaço
+por login** — se um dia você logar num segundo workspace Slack na mesma
+ponte, ele vira outro espaço sozinho, igual já acontece por guild no
+Discord.
+
+Isso **não tira nada de "Pessoas"**: a lista de Pessoas no Element vem da
+conta `m.direct`, que é independente de a sala também ser filha de um
+espaço — uma sala pode aparecer nos dois lugares ao mesmo tempo. Por isso dá
+pra esconder o volume de grupos/canais dentro do espaço da ponte sem perder
+as conversas individuais soltas em Pessoas.
+
+### Criptografia (o servidor só guarda texto cifrado; mensagem só se lê logado no Element)
+
+```yaml
+encryption:
+  allow: true
+  default: true
+```
+
+No Discord esse bloco fica **aninhado dentro de `bridge:`**, não solto no
+topo do arquivo como em Slack/WhatsApp — é o motivo mais comum desse ajuste
+"não pegar" numa ponte legada.
+
+### Histórico automático
+
+Slack/WhatsApp (bridgev2):
+
+```yaml
+backfill:
+  enabled: true
+```
+
+Discord (framework legado, chave diferente):
+
+```yaml
+bridge:
+  backfill:
+    forward_limits:
+      initial: {dm: 50, channel: 50, thread: 20}
+      missed: {dm: 500, channel: 500, thread: 100}
+```
+
+### Double puppeting: manual nas três pontes, de propósito
+
+Escolhemos o método manual (`login-matrix`, ver
+[docs/SERVIDOR.md](docs/SERVIDOR.md) seção 3) para Slack, Discord e
+WhatsApp — não o automático (que exigiria o administrador registrar um
+segundo appservice pra sua conta, ou pior, uma chave-mestra do servidor
+inteiro nas pontes legadas). É a mesma troca de segurança de sempre,
+generalizada pras três: menos automação em troca de nenhum segredo com poder
+sobre a conta de outra pessoa em texto claro no seu notebook.
+
+**Efeito colateral aceito**: sem o appservice automático, um Synapse comum
+não anuncia a capability `BeeperAutoJoinInvites` (exclusiva do Beeper), e a
+ponte não tenta entrar sozinha nas salas que te convida — é preciso aceitar
+manualmente. Isso não é um bug: é a consequência direta de não ter mais um
+appservice de double puppeting administrado centralmente pelo servidor, como
+tinha a instalação anterior (`matrix_appservice_double_puppet_enabled` no
+`matrix-docker-ansible-deploy`).
 
 ## Segurança e limitações
 

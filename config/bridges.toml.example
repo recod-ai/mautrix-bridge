@@ -3,8 +3,9 @@
 # Cada [bridges.X] vira um serviço systemd: mautrix-bridge@X.service
 #
 # Não edite [server] aqui à mão — ele é escrito por "bridgectl init" (domínio
-# do Synapse, endereço da VPN, o Matrix ID do dono das pontes) e usado por
-# "bridgectl setup <ponte>" pra preencher o config de cada ponte sozinho.
+# do Synapse, endereço público HTTPS do Synapse, seu IP na VPN, o Matrix ID
+# do dono das pontes) e usado por "bridgectl setup <ponte>" pra preencher o
+# config de cada ponte sozinho.
 
 [defaults]
 # "release" = GitHub releases (estável)  |  "ci" = último build verde do main no mau.dev
