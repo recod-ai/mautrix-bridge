@@ -27,13 +27,7 @@ chmod 700 "$CFG" \
 systemctl --user daemon-reload
 
 echo
-echo "Instalado. Próximos passos:"
-echo "  1. sudo pacman -S python-keyring gnome-keyring wireguard-tools   (ou pip install --user keyring)"
-echo "  2. edite $CFG/bridges.toml se quiser mudar quais pontes existem"
-echo "  3. bridgectl init            # domínio do Synapse, endereço, seu Matrix ID"
-echo "  4. bridgectl setup slack     # baixa, gera config/registration, harvesta os segredos"
-echo "  5. copie o registration.yaml pro servidor -- ver docs/SERVIDOR.md"
-echo "  6. systemctl --user enable --now mautrix-bridge@slack"
+echo "Instalado. Próximos passos: ver README.md (seção 'Uso')."
 echo
 case ":$PATH:" in
     *":$BIN:"*) ;;

@@ -124,7 +124,7 @@ def load_config() -> dict:
         bridges[name] = merged
     if not bridges:
         die("nenhuma ponte declarada em [bridges.*] no bridges.toml")
-    return {"defaults": defaults, "bridges": bridges, "server": raw.get("server", {})}
+    return {"defaults": defaults, "bridges": bridges, "server": raw.get("server", {}), "wireguard": raw.get("wireguard", {})}
 
 
 def get_bridge(cfg: dict, name: str) -> dict:
@@ -338,10 +338,17 @@ def cmd_harvest(cfg: dict, args: argparse.Namespace) -> int:
         m = re.match(r"^(\s*)([A-Za-z0-9_]+):\s*(.+?)\s*$", line)
         if m and m.group(2) in keys:
             indent, key, raw = m.groups()
-            if raw.startswith("${keyring:") or raw in {"null", "~", '""', "''"}:
+            # raw still carries whatever quoting was in the file (harvest
+            # always writes its placeholders quoted), so the "already
+            # harvested" check has to look at the unquoted value — checking
+            # raw itself would never match a quoted placeholder, and a
+            # second harvest of an already-harvested file would treat
+            # '"${keyring:as_token}"' as a literal secret and overwrite the
+            # real value in the keyring with that placeholder string.
+            value = raw.strip('"').strip("'")
+            if value.startswith("${keyring:") or value in {"null", "~", ""}:
                 out_lines.append(line)
                 continue
-            value = raw.strip('"').strip("'")
             kname = f"{args.name}_{key}" if args.prefix else key
             kr.set_password(service, kname, value)
             out_lines.append(f'{indent}{key}: "${{keyring:{kname}}}"')
@@ -451,6 +458,31 @@ def cmd_reveal(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def fetch_legacy_example_config(repo: str, dest: Path) -> None:
+    """Pontes legadas (sem a flag '-e' de auto-config, ex: mautrix-discord) não
+    geram um config de exemplo sozinhas — o example-config.yaml mora solto no
+    repositório da ponte no GitHub. Baixa exatamente esse arquivo, tentando os
+    dois nomes de branch default que o GitHub usa hoje em dia."""
+    last_error = None
+    for branch in ("main", "master"):
+        url = f"https://raw.githubusercontent.com/mautrix/{repo}/{branch}/example-config.yaml"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                text = resp.read().decode("utf-8")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
+            log(f"example-config.yaml baixado de {url}")
+            return
+        except urllib.error.HTTPError as e:
+            last_error = e
+            continue
+        except urllib.error.URLError as e:
+            die(f"não consegui baixar {url}: {e}")
+    die(f"não encontrei example-config.yaml em https://github.com/mautrix/{repo} "
+        f"(tentei main e master, {last_error}) — baixe manualmente e salve como {dest}")
+
+
 def cmd_bootstrap(cfg: dict, args: argparse.Namespace) -> int:
     """Gera config/registration de exemplo no diretório da ponte, para você editar."""
     b = get_bridge(cfg, args.name)
@@ -466,12 +498,9 @@ def cmd_bootstrap(cfg: dict, args: argparse.Namespace) -> int:
     import subprocess
     r = subprocess.run([str(binary), "-e", "-c", str(cfg_file)], capture_output=True, text=True)
     if r.returncode != 0 or not cfg_file.exists():
-        log(f"'{b['binary']} -e' não funcionou (pontes legadas, como discord, não têm essa flag).")
-        log(f"Pegue o example-config.yaml de https://github.com/mautrix/{b['repo']} "
-            f"e salve como {cfg_file}")
-        if r.stderr.strip():
-            log(r.stderr.strip().splitlines()[-1])
-        return 1
+        log(f"'{b['binary']} -e' não funcionou (pontes legadas, como {args.name}, não têm essa "
+            f"flag) — baixando o example-config.yaml do repositório.")
+        fetch_legacy_example_config(b["repo"], cfg_file)
     os.chmod(cfg_file, 0o600)
     log(f"config de exemplo em {cfg_file}")
     if not getattr(args, "quiet_hint", False):
@@ -484,16 +513,36 @@ MXID_RE = re.compile(r"^@([^:]+):(.+)$")
 
 
 def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
-    """Pergunta os dados do servidor uma única vez e grava em [server] no bridges.toml."""
+    """Pergunta os dados do servidor uma única vez e grava em [server] no bridges.toml.
+    Se já houver uma configuração, mostra o que está gravado e só pergunta de novo se o
+    usuário confirmar que quer editar — nesse caso, os valores atuais viram o default de
+    cada campo (Enter mantém o que já estava lá)."""
+    existing = cfg.get("server", {})
+    if existing.get("homeserver_domain"):
+        print("Já existe uma configuração de servidor:")
+        print(f"  domínio do Synapse:      {existing.get('homeserver_domain')}")
+        print(f"  endereço do Synapse:     {existing.get('homeserver_address')}")
+        print(f"  seu IP na VPN:           {existing.get('vpn_ip')}")
+        print(f"  dono das pontes:         {existing.get('owner_mxid') or '(nenhum)'}")
+        if input("\nEditar esses valores? [s/N]: ").strip().lower() not in ("s", "sim", "y", "yes"):
+            log("nada mudou")
+            return 0
+        print()
+
     print("Configuração do servidor (usada por 'bridgectl setup' em todas as pontes)\n")
-    domain = input("Domínio do seu Synapse (server_name, ex: matrix.exemplo.com): ").strip()
+
+    default_domain = existing.get("homeserver_domain", "")
+    domain = input(
+        f"Domínio do seu Synapse (server_name, ex: matrix.exemplo.com)"
+        + (f" [{default_domain}]: " if default_domain else ": ")
+    ).strip() or default_domain
     if not domain:
         die("domínio é obrigatório")
 
     # Esse é o endereço que A PONTE usa pra falar com o Synapse (saída) — é tráfego
     # normal de cliente HTTPS, não precisa de VPN pra isso, mesmo a ponte rodando
     # em outra máquina. Convenção comum: subdomínio "matrix." do domínio do servidor.
-    default_address = f"https://matrix.{domain}"
+    default_address = existing.get("homeserver_address") or f"https://matrix.{domain}"
     address = input(
         f"Endereço público do Synapse (HTTPS, o mesmo que seu Element usa) [{default_address}]: "
     ).strip() or default_address
@@ -501,19 +550,23 @@ def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
     # Esse já é o sentido contrário: o Synapse chamando DE VOLTA a ponte (webhook do
     # appservice) — like a ponte roda atrás de NAT, só chega até ela pela VPN. É por
     # isso que existe um campo separado do endereço acima.
+    default_vpn_ip = existing.get("vpn_ip", "")
     vpn_ip = input(
-        "Seu IP nesta VPN WireGuard (o administrador te deu, ex: 10.10.0.2): "
-    ).strip()
+        "Seu IP nesta VPN WireGuard (o administrador te deu, ex: 10.10.0.2)"
+        + (f" [{default_vpn_ip}]: " if default_vpn_ip else ": ")
+    ).strip() or default_vpn_ip
     if not vpn_ip:
         die("IP na VPN é obrigatório — sem ele o Synapse não consegue chamar sua ponte de volta")
     if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", vpn_ip):
         die(f"'{vpn_ip}' não parece um IPv4 (ex: 10.10.0.2)")
 
+    default_owner = existing.get("owner_mxid", "")
     owner = input(
         "Seu Matrix ID (dono das suas pontes — ganha o nível de permissão "
         "'admin' *dentro* de cada ponte, sem relação com ser admin do Synapse; "
-        "ex: @voce:matrix.exemplo.com, deixe em branco pra pular): "
-    ).strip()
+        "ex: @voce:matrix.exemplo.com"
+        + (f") [{default_owner}]: " if default_owner else ", deixe em branco pra pular): ")
+    ).strip() or default_owner
 
     if owner:
         m = MXID_RE.match(owner)
@@ -554,6 +607,182 @@ def cmd_init(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# VPN (WireGuard <-> NetworkManager)
+# --------------------------------------------------------------------------- #
+
+WG_KEYRING_SERVICE = "bridgectl-wireguard"
+WG_KEYRING_KEY = "private_key"
+VPN_CONN_NAME = "bridgectl-vpn"
+
+# Token pessoal mostrado em /propylaia — não é a chave WireGuard, é o que
+# autentica bridgectl (não um navegador) pra buscar as credenciais já
+# pré-registradas no pool de pontes (ver fetch_pool_slot/POOL_BRIDGE_TYPES
+# abaixo e docs/ADICIONAR-PONTE.md "Pool de pontes" no repo agorae).
+PROPYLAIA_KEYRING_SERVICE = "bridgectl-propylaia"
+PROPYLAIA_KEYRING_KEY = "api_token"
+
+
+def cmd_vpn_init(cfg: dict, args: argparse.Namespace) -> int:
+    """Pergunta os dados do peer WireGuard do servidor uma única vez e grava em
+    [wireguard] no bridges.toml (e o token de API do propylaia no chaveiro).
+    Mesma lógica de 'init': se já existir, mostra o que está gravado e só
+    edita se confirmado, com os valores atuais como default."""
+    existing = cfg.get("wireguard", {})
+    kr = keyring_mod()
+    existing_token = kr.get_password(PROPYLAIA_KEYRING_SERVICE, PROPYLAIA_KEYRING_KEY)
+    if existing.get("server_public_key"):
+        print("Já existe uma configuração de VPN:")
+        print(f"  chave pública do servidor:  {existing.get('server_public_key')}")
+        print(f"  endereço do servidor:       {existing.get('endpoint')}")
+        print(f"  IP do servidor na VPN:      {existing.get('server_vpn_ip')}")
+        print(f"  token de API (propylaia):   {'(gravado)' if existing_token else '(nenhum)'}")
+        if input("\nEditar esses valores? [s/N]: ").strip().lower() not in ("s", "sim", "y", "yes"):
+            log("nada mudou")
+            return 0
+        print()
+
+    print("Configuração da VPN WireGuard (usada por 'bridgectl vpn')\n")
+
+    default_pubkey = existing.get("server_public_key", "")
+    pubkey = input(
+        "Chave pública do servidor WireGuard (o administrador te deu)"
+        + (f" [{default_pubkey}]: " if default_pubkey else ": ")
+    ).strip() or default_pubkey
+    if not pubkey:
+        die("chave pública do servidor é obrigatória")
+
+    default_endpoint = existing.get("endpoint", "")
+    endpoint = input(
+        "Endereço do servidor (host:porta, ex: boule.exemplo.com:51820)"
+        + (f" [{default_endpoint}]: " if default_endpoint else ": ")
+    ).strip() or default_endpoint
+    if not endpoint:
+        die("endereço do servidor é obrigatório")
+
+    default_server_vpn_ip = existing.get("server_vpn_ip", "")
+    server_vpn_ip = input(
+        "IP do servidor dentro da VPN (ex: 10.10.0.1)"
+        + (f" [{default_server_vpn_ip}]: " if default_server_vpn_ip else ": ")
+    ).strip() or default_server_vpn_ip
+    if not server_vpn_ip:
+        die("IP do servidor na VPN é obrigatório")
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", server_vpn_ip):
+        die(f"'{server_vpn_ip}' não parece um IPv4")
+
+    default_token_shown = "(mantém o já gravado)" if existing_token else "(deixe em branco pra pular)"
+    token = input(
+        f"Token de API do propylaia (mostrado em /propylaia, pra 'setup' buscar sozinho "
+        f"Discord/Slack/WhatsApp pré-registrados) {default_token_shown}: "
+    ).strip()
+
+    print("\nConfira antes de gravar:")
+    print(f"  chave pública do servidor:  {pubkey}")
+    print(f"  endereço do servidor:       {endpoint}")
+    print(f"  IP do servidor na VPN:      {server_vpn_ip}")
+    print(f"  token de API (propylaia):   {'(novo valor colado)' if token else default_token_shown}")
+    if input("Gravar? [S/n]: ").strip().lower() not in ("", "s", "sim", "y", "yes"):
+        die("cancelado, nada foi gravado")
+
+    path = CONFIG_DIR / "bridges.toml"
+    text = path.read_text() if path.exists() else ""
+    block = (
+        f'[wireguard]\nserver_public_key = "{pubkey}"\nendpoint = "{endpoint}"\n'
+        f'server_vpn_ip = "{server_vpn_ip}"\n'
+    )
+    if re.search(r"(?m)^\[wireguard\]", text):
+        text = re.sub(r"(?ms)^\[wireguard\].*?(?=^\[|\Z)", block + "\n", text, count=1)
+    else:
+        text = block + "\n" + text
+    path.write_text(text)
+    if token:
+        kr.set_password(PROPYLAIA_KEYRING_SERVICE, PROPYLAIA_KEYRING_KEY, token)
+        log("token de API gravado no chaveiro")
+    log(f"gravado em {path}")
+    log("agora rode: bridgectl vpn")
+    return 0
+
+
+def cmd_vpn(cfg: dict, args: argparse.Namespace) -> int:
+    """Gera (ou reaproveita) seu par de chaves WireGuard — a privada nunca toca
+    disco fora de um arquivo temporário apagado no fim deste comando — e importa
+    a conexão no NetworkManager, com a chave movida pro chaveiro do sistema."""
+    import subprocess
+    import tempfile
+
+    wg_cfg = cfg.get("wireguard", {})
+    server_pubkey = wg_cfg.get("server_public_key")
+    endpoint = wg_cfg.get("endpoint")
+    server_vpn_ip = wg_cfg.get("server_vpn_ip")
+    client_vpn_ip = cfg.get("server", {}).get("vpn_ip")
+
+    if not (server_pubkey and endpoint and server_vpn_ip):
+        die("rode 'bridgectl vpn-init' primeiro (dados do peer do servidor ainda não configurados)")
+    if not client_vpn_ip:
+        die("rode 'bridgectl init' primeiro (seu IP nesta VPN ainda não está configurado)")
+    if shutil.which("nmcli") is None:
+        die("'nmcli' não encontrado — instale o NetworkManager (ex: pacman -S networkmanager)")
+    if shutil.which("wg") is None:
+        die("'wg' não encontrado — instale o wireguard-tools")
+
+    kr = keyring_mod()
+    private_key = kr.get_password(WG_KEYRING_SERVICE, WG_KEYRING_KEY)
+    if private_key:
+        log("reaproveitando a chave WireGuard já existente no chaveiro")
+    else:
+        private_key = subprocess.run(["wg", "genkey"], capture_output=True, text=True, check=True).stdout.strip()
+        kr.set_password(WG_KEYRING_SERVICE, WG_KEYRING_KEY, private_key)
+        log("chave WireGuard nova gerada e gravada no chaveiro")
+
+    public_key = subprocess.run(
+        ["wg", "pubkey"], input=private_key, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    print(f"\nSua chave pública: {public_key}")
+    print("Cole essa chave onde o administrador do seu servidor pediu (ex.: a página "
+          "/propylaia da agorae) antes de continuar.\n")
+    if input("Já registrou a chave e quer conectar agora? [S/n]: ").strip().lower() not in ("", "s", "sim", "y", "yes"):
+        log("ok — rode 'bridgectl vpn' de novo quando tiver registrado")
+        return 0
+
+    before = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME", "connection", "show"], capture_output=True, text=True
+    ).stdout.splitlines()
+
+    if VPN_CONN_NAME in before:
+        log(f"conexão '{VPN_CONN_NAME}' já existe, só subindo")
+        return subprocess.run(["nmcli", "connection", "up", VPN_CONN_NAME]).returncode
+
+    tmp = Path(tempfile.mkstemp(suffix=".conf")[1])
+    try:
+        tmp.write_text(
+            f"[Interface]\nPrivateKey = {private_key}\nAddress = {client_vpn_ip}/24\n\n"
+            f"[Peer]\nPublicKey = {server_pubkey}\nEndpoint = {endpoint}\n"
+            f"AllowedIPs = {server_vpn_ip}/32\nPersistentKeepalive = 25\n"
+        )
+        os.chmod(tmp, 0o600)
+        r = subprocess.run(
+            ["nmcli", "connection", "import", "type", "wireguard", "file", str(tmp)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            die(f"'nmcli connection import' falhou: {r.stderr.strip()}")
+
+        after = subprocess.run(
+            ["nmcli", "-t", "-f", "NAME", "connection", "show"], capture_output=True, text=True
+        ).stdout.splitlines()
+        new_name = next((n for n in after if n not in before), None)
+        if not new_name:
+            die("não consegui identificar a conexão recém-importada — confira 'nmcli connection show'")
+
+        subprocess.run(["nmcli", "connection", "modify", new_name, "connection.id", VPN_CONN_NAME], check=True)
+        subprocess.run(["nmcli", "connection", "modify", VPN_CONN_NAME, "wireguard.private-key-flags", "1"], check=True)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    log(f"conexão '{VPN_CONN_NAME}' importada, chave privada movida pro chaveiro")
+    return subprocess.run(["nmcli", "connection", "up", VPN_CONN_NAME]).returncode
+
+
 def patch_config(cfg_file: Path, server: dict) -> None:
     """Preenche homeserver.address/domain, appservice.address/hostname e bridge.permissions
     no lugar dos placeholders de exemplo, quando ainda estão intocados. Pontes legadas (sem
@@ -574,8 +803,13 @@ def patch_config(cfg_file: Path, server: dict) -> None:
     text = cfg_file.read_text()
     before = text
 
+    # Two different literal placeholders show up here depending on how the
+    # config was generated: bridgev2 bridges' "-e" auto-config uses
+    # "http://example.localhost:8008"; the plain example-config.yaml a
+    # legacy bridge (mautrix-discord) asks you to fetch by hand uses
+    # "https://matrix.example.com" instead.
     text = re.sub(
-        r"^(\s*)address: http://example\.localhost:8008\s*$",
+        r"^(\s*)address: (?:http://example\.localhost:8008|https://matrix\.example\.com)\s*$",
         rf"\1address: {address}", text, count=1, flags=re.M,
     )
     text = re.sub(
@@ -585,6 +819,18 @@ def patch_config(cfg_file: Path, server: dict) -> None:
     text = text.replace('"example.com": user', f'"{domain}": user')
     if owner:
         text = text.replace('"@admin:example.com": admin', f'"{owner}": admin')
+
+    # The example config's database placeholder is a postgres URI that was
+    # never meant to be run as-is — untouched, the bridge dies at startup
+    # with "appservice.database not configured". A single-person bridge has
+    # no reason to run postgres at all, so point it at a local sqlite file
+    # next to config.yaml instead (bridgev2 bridges accept "sqlite3-fk-wal").
+    text = re.sub(r"^(\s*)type: postgres\s*$", r"\1type: sqlite3-fk-wal", text, count=1, flags=re.M)
+    text = re.sub(
+        r"^(\s*)uri: postgres://user:password@host/database\S*\s*$",
+        rf"\1uri: file:{cfg_file.parent / (cfg_file.parent.name + '.db')}?_txlock=immediate",
+        text, count=1, flags=re.M,
+    )
 
     if vpn_ip:
         text = re.sub(
@@ -609,6 +855,447 @@ def patch_config(cfg_file: Path, server: dict) -> None:
         f"bridge.permissions preenchidos")
 
 
+def _section_span(text: str, section: str) -> tuple[int, int] | None:
+    """Char offsets (start, end) of a top-level `section:` block's body — from
+    right after its header line to right before the next top-level (unindented)
+    line, or EOF. No YAML parser here on purpose (same reasoning as harvest/
+    patch_config): this file is meant to stay hand-editable, so we only ever
+    touch specific known lines with plain text/regex, never rewrite the whole
+    structure."""
+    m = re.search(rf"(?m)^{re.escape(section)}:\s*$", text)
+    if not m:
+        return None
+    start = m.end() + 1
+    m2 = re.search(r"(?m)^\S", text[start:])
+    end = start + m2.start() if m2 else len(text)
+    return start, end
+
+
+def _nested_span(text: str, key: str) -> tuple[int, int] | None:
+    """Like _section_span, but for a `key:` block at ANY indentation, not
+    just top-level (column 0) — needed for keys nested more than one level
+    deep, e.g. discord's bridge.encryption (whatsapp/slack keep the same
+    key at top level, so _section_span already covers those). Bounded by
+    the next line whose indentation is the same as or shallower than the
+    key's own line."""
+    m = re.search(rf"(?m)^([ \t]*){re.escape(key)}:\s*$", text)
+    if not m:
+        return None
+    indent = m.group(1)
+    start = m.end() + 1
+    for m2 in re.finditer(r"(?m)^([ \t]*)\S", text[start:]):
+        if len(m2.group(1)) <= len(indent):
+            return start, start + m2.start()
+    return start, len(text)
+
+
+# How much message history to backfill when a portal is first created —
+# every bridge type ships this OFF or ON differently by default (confirmed
+# against each bridge's actual example-config.yaml this session): Discord
+# defaults to fully disabled (0), while WhatsApp/Slack already default to
+# unlimited. Offered as a one-time choice during 'setup' (a fresh config
+# only — see cmd_setup) instead of leaving everyone to discover and hand-edit
+# this after the fact. Each bridge type's schema is completely different
+# (bridgev2 unified nothing here), so this is a real per-type table, not one
+# generic knob.
+BACKFILL_PRESETS = {
+    "discord": {
+        "none": {"initial": (0, 0, 0), "missed": (0, 0, 0)},
+        "limited": {"initial": (20, 20, 0), "missed": (-1, -1, -1)},
+        "all": {"initial": (500, 500, 0), "missed": (-1, -1, -1)},
+    },
+    "whatsapp": {
+        "none": {"max_initial_conversations": 0},
+        "limited": {"max_initial_conversations": 20},
+        "all": {"max_initial_conversations": -1},
+    },
+    "slack": {
+        "none": {"conversation_count": 0},
+        "limited": {"conversation_count": 20},
+        "all": {"conversation_count": -1},
+    },
+}
+
+
+def _replace_indented_triplet(text: str, anchor_key: str, dm: int, channel: int, thread: int) -> str:
+    """Discord's backfill.forward_limits.{initial,missed} blocks — each is
+    `<key>:` followed immediately by its own dm/channel/thread lines, in that
+    fixed order (matches the shipped example-config.yaml exactly). Replaces
+    the three value lines under one such block, wherever it's indented."""
+    pattern = re.compile(
+        rf"(?m)^(\s*){re.escape(anchor_key)}:\s*\n"
+        rf"(\s+)dm:\s*.*\n"
+        rf"\s+channel:\s*.*\n"
+        rf"\s+thread:\s*.*\n"
+    )
+
+    def repl(m: re.Match) -> str:
+        outer, inner = m.group(1), m.group(2)
+        return f"{outer}{anchor_key}:\n{inner}dm: {dm}\n{inner}channel: {channel}\n{inner}thread: {thread}\n"
+
+    new_text, n = pattern.subn(repl, text, count=1)
+    return new_text if n else text
+
+
+def apply_backfill_preset(cfg_file: Path, bridge_type: str, preset: str) -> bool:
+    """Patches the backfill knob(s) for one bridge type to one of
+    BACKFILL_PRESETS's presets. Returns whether anything actually changed —
+    each bridge's fields are matched by fixed structure (see
+    _replace_indented_triplet/set_in_section-style single-key replace), not
+    a real YAML parser, same reasoning as the rest of this file."""
+    fields = BACKFILL_PRESETS.get(bridge_type, {}).get(preset)
+    if not fields:
+        return False
+    text = cfg_file.read_text()
+
+    if bridge_type == "discord":
+        dm, channel, thread = fields["initial"]
+        text = _replace_indented_triplet(text, "initial", dm, channel, thread)
+        dm, channel, thread = fields["missed"]
+        text = _replace_indented_triplet(text, "missed", dm, channel, thread)
+    elif bridge_type == "whatsapp":
+        span = _section_span(text, "history_sync")
+        if span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)max_initial_conversations:\s*.*$",
+                lambda m: f"{m.group(1)}max_initial_conversations: {fields['max_initial_conversations']}",
+                text[span[0]:span[1]], count=1,
+            )
+            text = text[:span[0]] + section_text + text[span[1]:] if n else text
+    elif bridge_type == "slack":
+        span = _section_span(text, "backfill")
+        if span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)conversation_count:\s*.*$",
+                lambda m: f"{m.group(1)}conversation_count: {fields['conversation_count']}",
+                text[span[0]:span[1]], count=1,
+            )
+            text = text[:span[0]] + section_text + text[span[1]:] if n else text
+
+    cfg_file.write_text(text)
+    return True
+
+
+def maybe_reconfigure_backfill(cfg_file: Path, bridge_type: str) -> None:
+    """For a config that already exists (cmd_setup's 'else' branch) — unlike
+    the fresh-config path, this never touches anything unless explicitly
+    asked, since the current values might already be a deliberate choice
+    made earlier (by this same prompt, or by hand)."""
+    if bridge_type not in BACKFILL_PRESETS:
+        return
+    if input(f"\nQuer ajustar quanto histórico a ponte de {bridge_type} carrega em conversas "
+              f"novas? [s/N]: ").strip().lower() not in ("s", "sim", "y", "yes"):
+        return
+    preset = prompt_backfill_preset(bridge_type)
+    if preset and apply_backfill_preset(cfg_file, bridge_type, preset):
+        log(f"{cfg_file.name}: backfill ajustado para '{preset}'")
+
+
+def prompt_backfill_preset(bridge_type: str) -> str | None:
+    """Interactive one-time choice, only for bridge types BACKFILL_PRESETS
+    knows how to patch — silently skipped (returns None) for anything else,
+    same as fetch_pool_slot does for bridges outside the pool."""
+    if bridge_type not in BACKFILL_PRESETS:
+        return None
+    print("\nQuanto histórico carregar quando uma conversa for descoberta pela primeira vez?")
+    print("  1. nada (padrão mais seguro/rápido — dá pra ajustar depois à mão em config.yaml)")
+    print("  2. um pouco (as últimas ~20 mensagens de cada conversa)")
+    print("  3. tudo que der (primeira sincronização mais lenta/pesada)")
+    choice = input("Escolha [1/2/3, padrão 1]: ").strip() or "1"
+    return {"1": "none", "2": "limited", "3": "all"}.get(choice, "none")
+
+
+# Ghost displayname template per bridge type — confirmed against each
+# bridge's real example-config.yaml this session. Appends a fixed platform
+# suffix to whatever name the bridge would otherwise use, so a contact from
+# any bridge reads "Nome Sobrenome (discord)"/"(slack)"/"(wapp)" instead of
+# looking identical to a native stoa user. (section, key, new value) — the
+# section differs per bridge (discord keeps this under the legacy `bridge:`
+# block; whatsapp/slack, on the newer bridgev2 framework, put connector-
+# specific fields like this one under `network:` instead).
+DISPLAYNAME_TEMPLATES = {
+    "discord": ("bridge", "displayname_template",
+                "'{{if .Webhook}}Webhook{{else}}{{or .GlobalName .Username}}{{if .Bot}} (bot){{end}}{{end}} (discord)'"),
+    "whatsapp": ("network", "displayname_template",
+                 '\'{{or .BusinessName .PushName .Phone .RedactedPhone "Unknown user"}} (wapp)\''),
+    "slack": ("network", "displayname_template",
+              "'{{or .Profile.DisplayName .Profile.RealName .Name}}{{if .IsBot}} (bot){{end}} (slack)'"),
+}
+
+# WhatsApp/Slack (bridgev2) can drop the umbrella "everything" space while
+# keeping per-workspace/guild spaces — confirmed in mautrix/go's shared
+# bridgev2/space.go: `bridge.personal_filtering_spaces` only gates that one
+# umbrella space; per-team/guild spaces are unconditional and unaffected.
+# Discord's equivalent umbrella space has NO config toggle at all — it's
+# hardcoded in user.go/guildportal.go, so there's nothing to patch there;
+# leaving that one space once (as its owner already found out how to do) is
+# the only option short of forking the bridge itself.
+DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack"}
+
+# End-to-end encryption, on by default for all three pool bridge types —
+# Element already encrypts new private/DM rooms by default, and without this
+# the bridge simply can't take part in them ("End-to-end encryption isn't
+# enabled"). Confirmed against each bridge's real example-config.yaml:
+# discord (legacy framework) nests this under `bridge.encryption`; whatsapp/
+# slack (bridgev2, shared mautrix/go framework) have `encryption:` as its
+# own top-level section instead, sibling to `bridge:`. `allow: true` alone
+# is enough for encryption to work; `appservice: true` (inside encryption)
+# plus the top-level `appservice.ephemeral_events: true` (shared by all
+# three, and named the same as the boolean above purely by coincidence —
+# they're unrelated keys in unrelated sections) switch on MSC2409 to-device
+# delivery instead of plain /sync polling, which the docs recommend pairing
+# with it.
+def apply_house_style(cfg_file: Path, bridge_type: str) -> bool:
+    """Displayname suffix (all three) + no umbrella space (whatsapp/slack
+    only — see DISABLE_UMBRELLA_SPACE) + encryption on by default (all
+    three — see POOL_BRIDGE_TYPES). Returns whether anything changed."""
+    text = cfg_file.read_text()
+    before = text
+
+    tmpl = DISPLAYNAME_TEMPLATES.get(bridge_type)
+    if tmpl:
+        section, key, value = tmpl
+        span = _section_span(text, section)
+        if span:
+            section_text, n = re.subn(
+                rf"(?m)^(\s*){key}:\s*.*$",
+                lambda m: f"{m.group(1)}{key}: {value}",
+                text[span[0]:span[1]], count=1,
+            )
+            if n:
+                text = text[:span[0]] + section_text + text[span[1]:]
+
+    if bridge_type in DISABLE_UMBRELLA_SPACE:
+        span = _section_span(text, "bridge")
+        if span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)personal_filtering_spaces:\s*.*$",
+                lambda m: f"{m.group(1)}personal_filtering_spaces: false",
+                text[span[0]:span[1]], count=1,
+            )
+            if n:
+                text = text[:span[0]] + section_text + text[span[1]:]
+
+    if bridge_type in POOL_BRIDGE_TYPES:
+        enc_start = enc_end = None
+        if bridge_type == "discord":
+            bridge_span = _section_span(text, "bridge")
+            if bridge_span:
+                nested = _nested_span(text[bridge_span[0]:bridge_span[1]], "encryption")
+                if nested:
+                    enc_start = bridge_span[0] + nested[0]
+                    enc_end = bridge_span[0] + nested[1]
+        else:  # whatsapp/slack (bridgev2): encryption is its own top-level section
+            enc_span = _section_span(text, "encryption")
+            if enc_span:
+                enc_start, enc_end = enc_span
+
+        if enc_start is not None:
+            section_text = text[enc_start:enc_end]
+            section_text, n1 = re.subn(
+                r"(?m)^(\s*)allow:\s*.*$", lambda m: f"{m.group(1)}allow: true", section_text, count=1,
+            )
+            section_text, n2 = re.subn(
+                r"(?m)^(\s*)appservice:\s*.*$", lambda m: f"{m.group(1)}appservice: true", section_text, count=1,
+            )
+            if n1 or n2:
+                text = text[:enc_start] + section_text + text[enc_end:]
+
+        appservice_span = _section_span(text, "appservice")
+        if appservice_span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)ephemeral_events:\s*.*$",
+                lambda m: f"{m.group(1)}ephemeral_events: true",
+                text[appservice_span[0]:appservice_span[1]], count=1,
+            )
+            if n:
+                text = text[:appservice_span[0]] + section_text + text[appservice_span[1]:]
+
+    if text == before:
+        return False
+    cfg_file.write_text(text)
+    return True
+
+
+def resync_config(cfg_file: Path, server: dict) -> bool:
+    """For a config.yaml that already has real values (not patch_config's
+    original example placeholders — those only ever get patched once), offer
+    to bring homeserver.address/domain and appservice.address/hostname back
+    in line with the CURRENT [server] values. Needed after editing those with
+    'bridgectl init' again: patch_config alone would silently do nothing the
+    second time, since its regexes only match the placeholder text, not
+    whatever real value is already there. Returns whether anything changed."""
+    domain = server.get("homeserver_domain")
+    address = server.get("homeserver_address")
+    vpn_ip = server.get("vpn_ip")
+    if not domain or not address:
+        return False
+
+    text = cfg_file.read_text()
+
+    def get_current(section: str, key: str) -> str | None:
+        span = _section_span(text, section)
+        if not span:
+            return None
+        m = re.search(rf"(?m)^\s*{key}:\s*(.+?)\s*$", text[span[0]:span[1]])
+        return m.group(1).strip('"').strip("'") if m else None
+
+    wanted = {("homeserver", "address"): address, ("homeserver", "domain"): domain}
+    cur_as_address = get_current("appservice", "address")
+    port_match = re.search(r":(\d+)$", cur_as_address) if cur_as_address else None
+    if vpn_ip and port_match:
+        wanted[("appservice", "address")] = f"http://{vpn_ip}:{port_match.group(1)}"
+        wanted[("appservice", "hostname")] = vpn_ip
+
+    # Same never-actually-configured postgres placeholder patch_config now
+    # fixes on new setups (see there) — caught here too so a config.yaml
+    # generated before that fix existed still gets it, without regenerating
+    # the whole file. "appservice.database not configured" at startup is
+    # the symptom if this never runs. Keyed on "type" alone, not "uri" —
+    # "uri" is in HARVEST_KEYS (cmd_setup calls cmd_harvest right after this),
+    # so on an already-broken config it's usually already "${keyring:uri}"
+    # by now (the *placeholder* got harvested as if it were a real secret,
+    # not the actual bug), which would never match a check for the raw
+    # placeholder text. "type" is never a harvested field, so it's still a
+    # reliable signal here — and this project has no legitimate reason for
+    # a single-person bridge to run real postgres, so "still says postgres"
+    # alone is enough to act on regardless of what "uri" currently shows.
+    if get_current("appservice", "type") == "postgres":
+        wanted[("appservice", "type")] = "sqlite3-fk-wal"
+        wanted[("appservice", "uri")] = f"file:{cfg_file.parent / (cfg_file.parent.name + '.db')}?_txlock=immediate"
+
+    diffs = []
+    for (section, key), new_value in wanted.items():
+        current = get_current(section, key)
+        if current is not None and current != new_value:
+            diffs.append((section, key, current, new_value))
+
+    if not diffs:
+        return False
+
+    print(f"\n{cfg_file.name} tem valores diferentes do [server] atual:")
+    for section, key, current, new_value in diffs:
+        print(f"  {section}.{key}: {current}  ->  {new_value}")
+    if input("Atualizar esses campos? [s/N]: ").strip().lower() not in ("s", "sim", "y", "yes"):
+        return False
+
+    for section, key, _current, new_value in diffs:
+        span = _section_span(text, section)
+        section_text = re.sub(
+            rf"(?m)^(\s*){key}:\s*.+?\s*$",
+            lambda m: f"{m.group(1)}{key}: {new_value}",
+            text[span[0]:span[1]], count=1,
+        )
+        text = text[:span[0]] + section_text + text[span[1]:]
+
+    cfg_file.write_text(text)
+    log(f"{cfg_file.name}: campos atualizados pro valor atual de [server]")
+    return True
+
+
+# Pontes que o servidor já pré-registra em lote (ver roles/metroon/files/app/src/
+# bridge-pool.js no repo agorae e docs/ADICIONAR-PONTE.md "Pool de pontes") —
+# pra essas, 'setup' busca credenciais reais do servidor em vez de gerar (e
+# precisar mandar pro administrador) as suas próprias.
+POOL_BRIDGE_TYPES = {"discord", "slack", "whatsapp"}
+
+
+def fetch_pool_slot(cfg: dict, bridge_type: str) -> dict | None:
+    """Busca no propylaia o slot pré-registrado deste tipo de ponte, se houver
+    um (ver POOL_BRIDGE_TYPES). None quando essa ponte não está no pool
+    (segue o fluxo antigo, sem erro) — die() nos outros casos, já que aí a
+    intenção clara era usar o pool e algo saiu errado."""
+    if bridge_type not in POOL_BRIDGE_TYPES:
+        return None
+    domain = cfg.get("server", {}).get("homeserver_domain")
+    if not domain:
+        return None
+    token = keyring_mod().get_password(PROPYLAIA_KEYRING_SERVICE, PROPYLAIA_KEYRING_KEY)
+    if not token:
+        log(f"sem token de API do propylaia (rode 'bridgectl vpn-init') — gerando um registro novo "
+            f"pra {bridge_type} em vez de usar o pool pré-registrado")
+        return None
+    url = f"https://metroon.{domain}/api/bridge-pool/{bridge_type}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept": "application/json", "Authorization": f"Bearer {token}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        if e.code == 409:
+            die(f"pool de {bridge_type} esgotado no servidor — avise o administrador pra "
+                f"expandir em /admin (seção 'Pool de pontes')")
+        if e.code == 401:
+            die("token de API do propylaia inválido ou ausente — rode 'bridgectl vpn-init' "
+                "de novo e cole o token atual mostrado em /propylaia")
+        die(f"propylaia respondeu {e.code} buscando o slot de {bridge_type}: {e.reason}")
+    except (urllib.error.URLError, TimeoutError) as e:
+        log(f"não consegui contatar o propylaia ({e}) — gerando um registro novo pra "
+            f"{bridge_type} em vez de usar o pool pré-registrado")
+        return None
+
+
+def apply_pool_config(cfg_file: Path, pool_slot: dict, server: dict) -> None:
+    """Aponta config.yaml pra escutar exatamente onde a `url` do slot promete
+    ao Synapse, e usa o username_template/bot_username reservados só pra esse
+    slot — sem isso, duas pessoas com o mesmo tipo de ponte teriam o mesmo
+    namespace de fantasmas no Synapse (ver docs/ADICIONAR-PONTE.md "Pool de
+    pontes"). as_token/hs_token também precisam bater com o registration.yaml
+    do pool exatamente, senão o Synapse não reconhece a ponte."""
+    from urllib.parse import urlparse
+    port = urlparse(pool_slot["url"]).port
+    text = cfg_file.read_text()
+
+    def set_in_section(text: str, section: str, key: str, value: str) -> str:
+        span = _section_span(text, section)
+        if not span:
+            return text
+        new_section, n = re.subn(
+            rf"(?m)^(\s*){re.escape(key)}:\s*.*$",
+            lambda m: f"{m.group(1)}{key}: {value}",
+            text[span[0]:span[1]], count=1,
+        )
+        return text[:span[0]] + new_section + text[span[1]:] if n else text
+
+    text = set_in_section(text, "appservice", "id", pool_slot["id"])
+    text = set_in_section(text, "appservice", "address", pool_slot["url"])
+    text = set_in_section(text, "appservice", "hostname", "0.0.0.0")
+    text = set_in_section(text, "appservice", "port", str(port))
+    text = set_in_section(text, "appservice", "username", pool_slot["bot_username"])
+    text = set_in_section(text, "appservice", "as_token", f'"{pool_slot["as_token"]}"')
+    text = set_in_section(text, "appservice", "hs_token", f'"{pool_slot["hs_token"]}"')
+    text = set_in_section(text, "bridge", "username_template", f"'{pool_slot['username_template']}'")
+
+    # patch_config's first pass grants "user" to the WHOLE homeserver domain
+    # (`"<domain>": user` in bridge.permissions) — fine for a bridge with one
+    # owner, but for a pool slot that would let ANY other student DM this
+    # specific bot (e.g. @discordbot_s003) and link their own account through
+    # it, defeating the entire point of one appservice per student (ver
+    # docs/ADICIONAR-PONTE.md e docs/ARQUITETURA-PONTES.md). Narrow that one
+    # entry down to just this slot's real owner, resolved server-side via
+    # Synapse's threepid index (never guessed from the email).
+    owner_mxid = pool_slot.get("owner_mxid")
+    domain = server.get("homeserver_domain")
+    if owner_mxid and domain:
+        wide = f'"{domain}": user'
+        narrow = f'"{owner_mxid}": user'
+        if wide in text:
+            text = text.replace(wide, narrow, 1)
+        elif narrow not in text:
+            log(f"{cfg_file.name}: não achei a permissão \"{domain}\": user em bridge.permissions pra "
+                f"restringir ao dono — confira à mão se só {owner_mxid} tem nível 'user'")
+    else:
+        log(f"{cfg_file.name}: servidor não mandou owner_mxid — bridge.permissions continua liberado "
+            f"pra todo mundo em {domain or 'todo o domínio'} (atualize o metroon)")
+
+    cfg_file.write_text(text)
+    log(f"{cfg_file.name}: appservice.address/hostname/port/tokens/bot.username, "
+        f"bridge.username_template e permissions ajustados pro slot do pool")
+
+
 def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
     """Um comando só: baixa o binário, gera config+registration, preenche os dados do
     servidor e move os segredos pro chaveiro. Ao final só falta copiar o registration
@@ -630,12 +1317,109 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
         rc = cmd_bootstrap(cfg, argparse.Namespace(name=args.name, force=False, quiet_hint=True))
         if rc != 0:
             die(f"{args.name}: gere {cfg_file} manualmente (ver mensagem acima) e rode 'bridgectl setup {args.name}' de novo")
+        patch_config(cfg_file, server)
+        if apply_house_style(cfg_file, b["repo"]):
+            log(f"{args.name}: nome com sufixo de plataforma"
+                + (" e space geral desativado" if b["repo"] in DISABLE_UMBRELLA_SPACE else "")
+                + (" e encryption ligada" if b["repo"] in POOL_BRIDGE_TYPES else "")
+                + " aplicados (padrão do projeto)")
+        preset = prompt_backfill_preset(b["repo"])
+        if preset and apply_backfill_preset(cfg_file, b["repo"], preset):
+            log(f"{args.name}: backfill ajustado para '{preset}'")
     else:
         log(f"{args.name}: config já existe, mantido")
+        resync_config(cfg_file, server)
+        maybe_reconfigure_backfill(cfg_file, b["repo"])
+        if b["repo"] in DISPLAYNAME_TEMPLATES and input(
+            f"\nQuer aplicar o nome com sufixo de plataforma"
+            + (" e desativar o space geral" if b["repo"] in DISABLE_UMBRELLA_SPACE else "")
+            + (" e ligar encryption" if b["repo"] in POOL_BRIDGE_TYPES else "")
+            + f" nessa ponte de {b['repo']}? [s/N]: "
+        ).strip().lower() in ("s", "sim", "y", "yes"):
+            if apply_house_style(cfg_file, b["repo"]):
+                log(f"{args.name}: ajustado")
 
-    patch_config(cfg_file, server)
+    def registered_id(path: Path) -> str | None:
+        m = re.search(r"(?m)^id:\s*(.+?)\s*$", path.read_text())
+        return m.group(1).strip('"').strip("'") if m else None
 
-    if not reg_file.exists():
+    def configured_appservice_id(path: Path) -> str | None:
+        # config.yaml has its OWN separate appservice.id (used by the bridge
+        # itself to build the /_matrix/client/v1/appservice/{id}/ping URL) —
+        # independent of registration.yaml's id, and apply_pool_config could
+        # easily fix one without the other in an earlier bridgectl version,
+        # which is exactly the "Mismatching application service ID in path"
+        # 403 this also guards against.
+        text = path.read_text()
+        span = _section_span(text, "appservice")
+        if not span:
+            return None
+        m = re.search(r"(?m)^\s*id:\s*(.+?)\s*$", text[span[0]:span[1]])
+        return m.group(1).strip('"').strip("'") if m else None
+
+    def permissions_scoped_to_owner(path: Path, domain: str | None) -> bool:
+        # patch_config's first pass grants bridge.permissions "user" to the
+        # WHOLE domain (fine for a legacy single-owner bridge) — apply_pool_config
+        # narrows that one entry down to the slot's real owner. A config.yaml
+        # written by a bridgectl version older than that fix still has the
+        # wide grant, which lets any other student command this specific bot.
+        if not domain:
+            return True  # can't tell without a domain to check against
+        text = path.read_text()
+        span = _section_span(text, "bridge")
+        if not span:
+            return True
+        return f'"{domain}": user' not in text[span[0]:span[1]]
+
+    # Sempre confere o pool primeiro, mesmo se registration.yaml já existe —
+    # um arquivo gerado antes do pool existir (ou pra outro slot, ou antes
+    # de um fix do bridgectl) tem um as_token/id que o Synapse não reconhece
+    # mais depois que o pool foi aplicado (sintomas: "M_UNKNOWN_TOKEN: Token
+    # is not active" ou "Mismatching application service ID in path" no log
+    # do systemd), e sem essa checagem 'setup' nunca mais tentaria corrigir
+    # isso sozinho. O mesmo vale pra bridge.permissions ainda liberado pro
+    # domínio inteiro (ver permissions_scoped_to_owner acima) — reaplica o
+    # slot do pool de novo pra estreitar isso, mesmo com os ids já batendo.
+    pool_slot = fetch_pool_slot(cfg, b["repo"])
+    existing_reg_id = registered_id(reg_file) if reg_file.exists() else None
+    existing_cfg_id = configured_appservice_id(cfg_file) if cfg_file.exists() else None
+    ids_match = existing_reg_id == pool_slot["id"] and existing_cfg_id == pool_slot["id"] if pool_slot else False
+    perms_scoped = (
+        not pool_slot.get("owner_mxid")
+        or permissions_scoped_to_owner(cfg_file, server.get("homeserver_domain"))
+    ) if (pool_slot and cfg_file.exists()) else True
+    in_sync = ids_match and perms_scoped
+
+    if pool_slot and in_sync:
+        pool_slot = None  # já é o slot certo dos dois lados, nada a fazer
+        if reg_file.exists():
+            log(f"{args.name}: já é o slot do pool ({existing_reg_id}), mantido")
+
+    if pool_slot and reg_file.exists():
+        if not ids_match:
+            print(f"\n{args.name}: config atual (registration id: {existing_reg_id}, appservice.id no "
+                  f"config.yaml: {existing_cfg_id}) não bate com o slot do pool pré-registrado (id: "
+                  f"{pool_slot['id']}) — geralmente porque foi gerado (ou ajustado por uma versão mais "
+                  f"antiga do bridgectl) antes disso ser corrigido. O Synapse não reconhece esse estado.")
+        else:
+            print(f"\n{args.name}: bridge.permissions ainda libera \"{server.get('homeserver_domain')}\": "
+                  f"user (todo aluno do domínio, não só você) — config gerado antes desse ajuste existir. "
+                  f"Não afeta o Synapse, mas deixa esse bot aceitando comando de qualquer aluno, não só "
+                  f"{pool_slot.get('owner_mxid', 'você')}.")
+        if input(f"Corrigir pro slot do pool ({pool_slot['id']})? [S/n]: ").strip().lower() not in (
+            "", "s", "sim", "y", "yes"
+        ):
+            log(f"{args.name}: mantido como está "
+                + ("(pode continuar dando erro de token/ID)" if not ids_match else
+                   "(bridge.permissions continua liberado pro domínio inteiro)"))
+            pool_slot = None
+
+    if pool_slot:
+        reg_file.write_text(pool_slot["registration_yaml"])
+        os.chmod(reg_file, 0o600)
+        apply_pool_config(cfg_file, pool_slot, server)
+        log(f"{args.name}: registration.yaml = slot do pool pré-registrado ({pool_slot['id']})")
+    elif not reg_file.exists():
         import subprocess
         r = subprocess.run(
             [str(binary), "-c", str(cfg_file), "-r", str(reg_file), "-g"],
@@ -656,9 +1440,13 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
 
     print()
     log(f"{args.name}: pronto. Falta:")
-    log(f"  1. 'bridgectl reveal {args.name}' pra pegar o registration.yaml com valores reais "
-        f"(o que ficou em {reg_file} tem só placeholder do chaveiro) e mandar pro administrador")
-    log(f"  2. systemctl --user enable --now mautrix-bridge@{args.name}")
+    if b["repo"] in POOL_BRIDGE_TYPES:
+        log(f"  1. systemctl --user enable --now mautrix-bridge@{args.name}   "
+            f"(nada pra mandar pro administrador — essa ponte já está registrada no servidor)")
+    else:
+        log(f"  1. 'bridgectl reveal {args.name}' pra pegar o registration.yaml com valores reais "
+            f"(o que ficou em {reg_file} tem só placeholder do chaveiro) e mandar pro administrador")
+        log(f"  2. systemctl --user enable --now mautrix-bridge@{args.name}")
     return 0
 
 
@@ -736,6 +1524,9 @@ def main() -> int:
     bs.set_defaults(func=cmd_bootstrap)
 
     sub.add_parser("init", help="pergunta os dados do servidor uma vez (usado por 'setup')").set_defaults(func=cmd_init)
+
+    sub.add_parser("vpn-init", help="pergunta os dados do peer WireGuard do servidor uma vez (usado por 'vpn')").set_defaults(func=cmd_vpn_init)
+    sub.add_parser("vpn", help="gera/reaproveita sua chave WireGuard e importa a conexão no NetworkManager").set_defaults(func=cmd_vpn)
 
     sp = sub.add_parser("setup", help="baixa, gera config/registration, preenche servidor e harvesta — tudo de uma vez")
     sp.add_argument("name")

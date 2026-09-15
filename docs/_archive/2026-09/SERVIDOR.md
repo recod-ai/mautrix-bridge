@@ -162,10 +162,9 @@ antigo caso você perca todos os dispositivos de uma vez.
 - [ ] Bot da ponte responde numa sala de teste
 - [ ] (opcional) double puppeting configurado — manual (`login-matrix`) de
       preferência
-- [ ] marcador de plataforma, space geral e criptografia já vieram
-      aplicados automaticamente pelo `setup` (ver README.md § Uso) — nada
-      a fazer aqui, exceto conferir se quer ajustar o histórico
-      (perguntado no próprio `setup`)
+- [ ] marcador/espaço/criptografia/histórico ajustados — ver
+      [README.md § Convenção recomendada](../README.md#convenção-recomendada-marcador-espaço-criptografia-e-histórico)
+      do repositório
 - [ ] chave de recuperação do Element configurada e guardada num gerenciador
       de senhas (seção 4) — não é segredo do bridgectl, mas evite deixar pra
       configurar depois de já ter histórico criptografado acumulado

@@ -261,21 +261,17 @@ oficial da ponte.
 
 ## Nota: pontes legadas (mautrix-discord, por exemplo)
 
-`mautrix-discord` não tem a flag `-e`. `bridgectl setup discord` baixa o
-binário, tenta o `-e`, e quando não acha baixa o `example-config.yaml` do
-repositório da ponte no GitHub sozinho (`raw.githubusercontent.com`, tenta
-`main` e depois `master`) e salva como
-`~/.config/mautrix-bridges/discord/config.yaml` — sem precisar buscar nem
-editar nada à mão. Depois disso o fluxo é idêntico ao de qualquer outra
-ponte: `patch_config` preenche `homeserver.address`/`domain` e
-`bridge.permissions`, e `appservice.address` (o IP da VPN, não `localhost` —
-esse é o campo que mais gente esquecia editar quando isso era manual).
-`appservice.hostname` fica em `0.0.0.0` (escuta em todas as interfaces,
-inclusive a VPN) — não precisa virar o IP da VPN também.
+`mautrix-discord` não tem a flag `-e`. `bridgectl setup discord` vai baixar o
+binário, tentar o `-e` e avisar que não achou — te aponta para o
+`example-config.yaml` do repo no GitHub. Baixe manualmente, salve como
+`~/.config/mautrix-bridges/discord/config.yaml`, edite à mão (o `setup` não
+sabe achar os placeholders num arquivo com formato diferente):
 
-Se o download falhar (repositório sem `example-config.yaml` nesse caminho, ou
-rede fora do ar), `bridgectl` avisa exatamente qual URL tentou e para aí —
-nesse caso ainda dá pra baixar manualmente e salvar no mesmo caminho, e rodar
-`bridgectl setup discord` de novo (ele percebe que o config já existe, pula o
-download e completa `-g` + harvest). Fora esse detalhe, o resto do fluxo
-(run, systemd, auto-update) é idêntico ao de qualquer outra ponte.
+- `homeserver.address`/`domain` e `bridge.permissions`, como sempre;
+- **`appservice.address`/`hostname`: coloque seu IP da VPN, não `localhost`**
+  — esse é o passo que mais gente esquece numa ponte legada, e o sintoma é a
+  ponte subir normalmente mas nunca receber nada do Synapse.
+
+Depois rode `bridgectl setup discord` de novo — ele percebe que o config já
+existe, pula o bootstrap e completa `-g` + harvest. Fora esse detalhe, o
+resto do fluxo (run, systemd, auto-update) é idêntico.

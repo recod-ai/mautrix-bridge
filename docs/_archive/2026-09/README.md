@@ -12,58 +12,26 @@ que precisa ser feito do lado do Synapse está em
 ## Instalação
 
 ```bash
-sudo pacman -S python-keyring gnome-keyring wireguard-tools networkmanager   # Arch; noutras distros: pip install --user keyring
+sudo pacman -S python-keyring gnome-keyring wireguard-tools   # Arch; noutras distros: pip install --user keyring
 ./install.sh
 ```
 
 ## Uso
 
 ```bash
-bridgectl vpn-init         # uma vez: peer WireGuard do servidor + seu token de API do propylaia
-bridgectl vpn              # gera sua chave, importa a VPN no NetworkManager — ver "Conectividade"
-bridgectl init             # uma vez: domínio do Synapse, endereço, seu IP na VPN, seu Matrix ID
-bridgectl setup slack      # baixa o binário, gera config, busca o registration e harvesta sozinho
+bridgectl init            # uma vez: domínio do Synapse, endereço, seu Matrix ID
+bridgectl setup slack     # baixa o binário, gera config+registration, harvesta os segredos
+bridgectl reveal slack --out registration-para-o-admin.yaml   # com os valores reais
 ```
 
-Rodar `init`, `vpn-init` ou `setup <ponte>` de novo depois de já configurado não
-te faz digitar tudo de novo — cada um mostra o que já está gravado e só volta
-a perguntar se você confirmar que quer editar (com os valores atuais já
-preenchidos como default).
-
-Numa config nova, `setup` também pergunta quanto histórico carregar quando
-uma conversa for descoberta pela primeira vez (nada / um pouco / tudo que
-der) — vale para Discord, Slack e WhatsApp, cada um com seu próprio jeito de
-guardar isso no `config.yaml` (o Discord vem desligado por padrão nesse
-ponto; Slack/WhatsApp já vêm sem limite). Pra mudar depois, edite
-`config.yaml` à mão (`backfill:`/`history_sync:`, dependendo da ponte).
-
-Para essas mesmas três pontes, `setup` também aplica sem perguntar (padrão
-do projeto): um sufixo de plataforma no nome dos fantasmas (`Nome Sobrenome
-(discord)`/`(slack)`/`(wapp)`), o space "geral" desativado no Slack/WhatsApp
-(o do Discord não tem essa opção — é fixo no próprio binário da ponte), e
-**end-to-end encryption ligada** (`encryption.allow`, sem o que o bot não
-consegue entrar em salas que o Element já cria criptografadas por padrão).
-Numa config já existente, `setup` pergunta antes de aplicar esses ajustes.
-
-Para **Discord, Slack e WhatsApp**, `setup` já busca um registro pré-feito no
-servidor (usando o token de API de `vpn-init`) — não precisa mandar nada pro
-administrador, é só ligar o serviço:
+Mande esse `registration-para-o-admin.yaml` para o administrador do servidor
+e apague sua cópia depois — siga [docs/SERVIDOR.md](docs/SERVIDOR.md) para
+essa parte. Depois:
 
 ```bash
 systemctl --user enable --now mautrix-bridge@slack
 journalctl --user -u mautrix-bridge@slack -f
 ```
-
-Para qualquer outra ponte (Telegram, Signal, Teams, ...), `setup` gera um
-registro novo do zero, e você ainda precisa mandar pro administrador:
-
-```bash
-bridgectl reveal telegram --out registration-para-o-admin.yaml   # com os valores reais
-```
-
-Mande esse `registration-para-o-admin.yaml` para o administrador do servidor
-e apague sua cópia depois — siga [docs/SERVIDOR.md](docs/SERVIDOR.md) para
-essa parte.
 
 **Antes de ir com tudo pro Synapse real, veja [docs/TESTING.md](docs/TESTING.md)**
 — um passo a passo verificado na prática pra validar cada peça isoladamente.
@@ -97,9 +65,8 @@ bridgectl setup whatsapp
 `setup` é idempotente — se algo já existe (config, registration) ele mantém e
 só completa o que falta, então rodar de novo depois de corrigir um erro é
 seguro. Pontes legadas sem o template automático (mautrix-discord, por
-exemplo) não têm a flag `-e` — nesse caso o `setup` baixa o
-`example-config.yaml` do repositório da ponte sozinho antes de continuar; ver
-a nota em [docs/TESTING.md](docs/TESTING.md).
+exemplo) avisam isso e pedem pra você buscar o `example-config.yaml` manual
+antes de completar — ver a nota em [docs/TESTING.md](docs/TESTING.md).
 
 `bridgectl status` mostra, por ponte, a versão instalada e se o segredo já
 está no chaveiro (coluna `segredos`) — é como saber quais pontes já estão
@@ -118,53 +85,31 @@ Tráfego de appservice tem duas direções, e só uma delas é o problema:
   sem ajuda — a solução é uma **VPN WireGuard** entre as duas máquinas, só
   pra essa chamada de volta.
 
-Do lado do servidor: [docs/SERVIDOR.md](docs/SERVIDOR.md). Do seu lado, dois
-comandos cuidam de tudo — sem editar `/etc/wireguard` nem mexer em systemd à
-mão, e a chave privada nunca fica num arquivo em texto puro (vai direto pro
-chaveiro):
+Do lado do servidor: [docs/SERVIDOR.md](docs/SERVIDOR.md). Do seu lado:
 
 ```bash
-bridgectl vpn-init   # uma vez: chave pública, endereço (host:porta) e IP do
-                      # servidor nesta VPN — o administrador te dá esses três
-bridgectl vpn        # gera seu par de chaves (ou reaproveita, se já existir),
-                      # mostra a chave pública pra você registrar no servidor,
-                      # e importa a conexão no NetworkManager
+wg genkey | tee privatekey | wg pubkey > publickey
 ```
 
-`vpn` para na hora de mostrar a chave pública e pergunta se você já registrou
-ela no servidor antes de continuar — registre (ex.: na página `/propylaia` da
-agorae, se for esse o seu caso) e responda "s". Ele então monta a conexão,
-renomeia pra `bridgectl-vpn` e move a chave privada pro chaveiro do sistema
-(`nmcli ... wireguard.private-key-flags 1`) — a conexão passa a aparecer no
-painel de rede do seu ambiente gráfico, igual uma VPN comum, sem precisar de
-`wg-quick` nem de um serviço systemd separado.
-
-**Prefere pela interface gráfica em vez de rodar o comando?** Dá pra fazer
-igual: GNOME (Configurações → Rede → "+" → "Importar de arquivo…") ou KDE
-(Configurações do Sistema → Conexões de Rede → Adicionar → WireGuard →
-Importar) sabem abrir um arquivo `.conf` no formato `wg-quick` direto — é
-esse mesmo arquivo que `bridgectl vpn` monta e descarta depois de importar.
-Depois de importado, tanto GNOME quanto KDE mostram um campo de senha/chave
-com uma opção "salvar só para este usuário" — é a versão gráfica do
-`wireguard.private-key-flags 1`.
-
-Se preferir configurar à mão (sem `nmcli` nem `bridgectl vpn`), o arquivo é
-um `.conf` padrão de `wg-quick`:
+`/etc/wireguard/wg0.conf`:
 
 ```ini
 [Interface]
-PrivateKey = <sua chave privada>
+PrivateKey = <conteúdo de privatekey>
 Address = 10.10.0.2/24
 
 [Peer]
 PublicKey = <chave pública do servidor>
-Endpoint = <endereço do servidor>:51820
+Endpoint = <ip-publico-do-servidor>:51820
 AllowedIPs = 10.10.0.1/32
 PersistentKeepalive = 25
 ```
 
-Em `bridgectl init` (Synapse) e `bridgectl vpn-init` (WireGuard), o "endereço"
-e o "IP na VPN" viram dois campos diferentes, não um só:
+```bash
+sudo systemctl enable --now wg-quick@wg0
+```
+
+Em `bridgectl init` isso vira dois campos diferentes, não um só:
 
 - **"Endereço público do Synapse"**: a URL HTTPS normal (ex:
   `https://matrix.exemplo.com`) — vira `homeserver.address` no config da
@@ -195,7 +140,77 @@ A unit do systemd roda `bridgectl update <ponte>` a cada início e reinício:
 Para congelar uma ponte, ponha `update_cooldown = 31536000` nela no
 `bridges.toml`.
 
-## Double puppeting: manual nas três pontes, de propósito
+## Convenção recomendada: marcador, espaço, criptografia e histórico
+
+Testado em produção (set/2026) com Slack, Discord e WhatsApp no mesmo
+Synapse. Se você recriar o servidor do zero, aplique os mesmos ajustes de
+`config.yaml` abaixo em cada ponte — todos retroagem em salas já existentes
+com um simples restart do serviço (confirmado via log: `Updating portal
+name` reaparece pras salas antigas assim que a ponte reinicia).
+
+### Marcador por ponte em "Pessoas"
+
+Use `displayname_template` (não `channel_name_template`) para isso: numa DM
+1:1, o nome da sala **sempre** vem do nome do fantasma — `channel_name_template`
+só vale para canais/grupos, é ignorado numa DM 1:1 mesmo que você edite ele.
+
+| Ponte    | sufixo   | campo                            |
+|----------|----------|-----------------------------------|
+| Slack    | `(SLCK)` | `network.displayname_template`   |
+| Discord  | `(DSRD)` | `bridge.displayname_template`    |
+| WhatsApp | `(WA)`   | já vem assim por padrão, sem editar |
+
+Teams: não incluído ainda — não existe ponte oficial madura (checado em
+set/2026; só existem projetos experimentais fora da organização
+`github.com/mautrix`, incompatíveis com o auto-update do `bridgectl`). O
+sufixo `(TMS)` fica reservado pra quando existir uma ponte confiável.
+
+### Espaço por servidor/workspace
+
+`bridge.personal_filtering_spaces: true` no Slack e no WhatsApp (Discord já
+tem esse comportamento fixo, sem opção pra desligar). Isso cria **um espaço
+por login** — se um dia você logar num segundo workspace Slack na mesma
+ponte, ele vira outro espaço sozinho, igual já acontece por guild no
+Discord.
+
+Isso **não tira nada de "Pessoas"**: a lista de Pessoas no Element vem da
+conta `m.direct`, que é independente de a sala também ser filha de um
+espaço — uma sala pode aparecer nos dois lugares ao mesmo tempo. Por isso dá
+pra esconder o volume de grupos/canais dentro do espaço da ponte sem perder
+as conversas individuais soltas em Pessoas.
+
+### Criptografia (o servidor só guarda texto cifrado; mensagem só se lê logado no Element)
+
+```yaml
+encryption:
+  allow: true
+  default: true
+```
+
+No Discord esse bloco fica **aninhado dentro de `bridge:`**, não solto no
+topo do arquivo como em Slack/WhatsApp — é o motivo mais comum desse ajuste
+"não pegar" numa ponte legada.
+
+### Histórico automático
+
+Slack/WhatsApp (bridgev2):
+
+```yaml
+backfill:
+  enabled: true
+```
+
+Discord (framework legado, chave diferente):
+
+```yaml
+bridge:
+  backfill:
+    forward_limits:
+      initial: {dm: 50, channel: 50, thread: 20}
+      missed: {dm: 500, channel: 500, thread: 100}
+```
+
+### Double puppeting: manual nas três pontes, de propósito
 
 Escolhemos o método manual (`login-matrix`, ver
 [docs/SERVIDOR.md](docs/SERVIDOR.md) seção 3) para Slack, Discord e
