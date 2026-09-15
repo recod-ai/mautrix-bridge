@@ -1038,13 +1038,22 @@ DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack"}
 # enabled"). Confirmed against each bridge's real example-config.yaml:
 # discord (legacy framework) nests this under `bridge.encryption`; whatsapp/
 # slack (bridgev2, shared mautrix/go framework) have `encryption:` as its
-# own top-level section instead, sibling to `bridge:`. `allow: true` alone
-# is enough for encryption to work; `appservice: true` (inside encryption)
-# plus the top-level `appservice.ephemeral_events: true` (shared by all
-# three, and named the same as the boolean above purely by coincidence —
-# they're unrelated keys in unrelated sections) switch on MSC2409 to-device
+# own top-level section instead, sibling to `bridge:`. `allow: true` lets
+# the bridge take part in a room someone else encrypted (e.g. Element's own
+# new-DM default), but does nothing for portals the bridge itself creates —
+# every Discord guild/channel portal — since nothing else ever sets
+# m.room.encryption on those; `default: true` is what makes the bridge set
+# it itself (confirmed live: without this, every such portal showed
+# Element's "End-to-end encryption isn't enabled", with no way to turn it
+# on from inside the room). `appservice: true` (inside encryption) plus the
+# top-level `appservice.ephemeral_events: true` (shared by all three, and
+# named the same as the boolean above purely by coincidence — they're
+# unrelated keys in unrelated sections) switch on MSC2409 to-device
 # delivery instead of plain /sync polling, which the docs recommend pairing
-# with it.
+# with it — the pool's own pre-registered registration.yaml also has to
+# declare this (de.sorunome.msc2409.push_ephemeral: true), or Synapse never
+# pushes those to-device messages to the appservice at all (see
+# ../metroon/src/bridge-pool.js's formatRegistrationYaml).
 def apply_house_style(cfg_file: Path, bridge_type: str) -> bool:
     """Displayname suffix (all three) + no umbrella space (whatsapp/slack
     only — see DISABLE_UMBRELLA_SPACE) + encryption on by default (all
@@ -1098,7 +1107,18 @@ def apply_house_style(cfg_file: Path, bridge_type: str) -> bool:
             section_text, n2 = re.subn(
                 r"(?m)^(\s*)appservice:\s*.*$", lambda m: f"{m.group(1)}appservice: true", section_text, count=1,
             )
-            if n1 or n2:
+            # `allow: true` alone only lets the bridge PARTICIPATE in a room
+            # someone else already encrypted (e.g. Element's own new-DM
+            # default) — it does nothing for portals the bridge itself
+            # creates (every Discord guild/channel portal), since nobody
+            # else sets m.room.encryption on those. `default: true` is what
+            # makes the bridge set it itself, confirmed live: without this,
+            # every Discord portal showed Element's "End-to-end encryption
+            # isn't enabled" with no way to turn it on from the room itself.
+            section_text, n3 = re.subn(
+                r"(?m)^(\s*)default:\s*.*$", lambda m: f"{m.group(1)}default: true", section_text, count=1,
+            )
+            if n1 or n2 or n3:
                 text = text[:enc_start] + section_text + text[enc_end:]
 
         appservice_span = _section_span(text, "appservice")
