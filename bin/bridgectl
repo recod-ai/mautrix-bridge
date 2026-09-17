@@ -1106,11 +1106,39 @@ def apply_backfill_preset(cfg_file: Path, bridge_type: str, preset: str) -> bool
             )
             text = text[:span[0]] + section_text + text[span[1]:] if n else text
     elif bridge_type == "slack":
-        span = _section_span(text, "backfill")
+        # Slack's own `conversation_count` lives in a `backfill:` block
+        # NESTED under the connector's `network:` section — NOT the shared
+        # bridgev2 top-level `backfill:` block (which only has `enabled`,
+        # `max_initial_messages`, etc., no `conversation_count` at all).
+        # _section_span only matches a column-0 header, so on a real merged
+        # config it silently resolved to the WRONG (top-level) block and
+        # this never actually wrote anything — confirmed live: a fresh
+        # Slack bridge kept conversation_count at its upstream default
+        # (-1) no matter what preset was picked here. _nested_span matches
+        # at any indentation, and finds this one first since it appears
+        # earlier in the file than the top-level block.
+        span = _nested_span(text, "backfill")
         if span:
             section_text, n = re.subn(
                 r"(?m)^(\s*)conversation_count:\s*.*$",
                 lambda m: f"{m.group(1)}conversation_count: {fields['conversation_count']}",
+                text[span[0]:span[1]], count=1,
+            )
+            text = text[:span[0]] + section_text + text[span[1]:] if n else text
+
+    if bridge_type in ("whatsapp", "slack"):
+        # Separate master switch (shared bridgev2 top-level `backfill:`
+        # section, column 0 — the one _section_span actually reaches here)
+        # that has to be on for ANY message history to come through at all,
+        # independent of conversation_count/max_initial_conversations above
+        # — confirmed live: a Slack bridge with conversation_count: -1 still
+        # backfilled zero messages because this defaults to false upstream
+        # and nothing here used to touch it.
+        span = _section_span(text, "backfill")
+        if span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)enabled:\s*.*$",
+                lambda m: f"{m.group(1)}enabled: {'true' if preset != 'none' else 'false'}",
                 text[span[0]:span[1]], count=1,
             )
             text = text[:span[0]] + section_text + text[span[1]:] if n else text
