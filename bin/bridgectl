@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -467,6 +468,25 @@ def cmd_harvest(cfg: dict, args: argparse.Namespace) -> int:
             if value.startswith("${keyring:") or value in {"null", "~", ""}:
                 out_lines.append(line)
                 continue
+            if value == "generate":
+                # bridgev2's own sentinel ("if this says 'generate', I'll make
+                # a random value myself on first run and persist it back to
+                # the config file I was given"). Harvesting always runs on
+                # the freshly-bootstrapped config, before the bridge has ever
+                # started — so without this, the literal word "generate" gets
+                # stored in the keyring as if it were the real secret, and
+                # every future 'bridgectl run' hands the bridge that same
+                # literal word again. The bridge dutifully generates a BRAND
+                # NEW random value every single time (never persisted, since
+                # it only ever sees the ephemeral runtime copy of the
+                # config), so anything encrypted/signed with the previous
+                # run's value stops matching on the very next restart —
+                # confirmed live: pickle_key doing this breaks the crypto
+                # account with "the supplied account key is invalid" on every
+                # restart. Generating the real value here instead, once, and
+                # persisting that to the keyring, is what actually fulfills
+                # the "generate" sentinel's intent under bridgectl's model.
+                value = secrets.token_hex(32)
             kname = f"{args.name}_{key}" if args.prefix else key
             kr.set_password(service, kname, value)
             out_lines.append(f'{indent}{key}: "${{keyring:{kname}}}"')
@@ -991,20 +1011,33 @@ def _encryption_span(text: str, bridge_type: str) -> tuple[int, int] | None:
     return _section_span(text, "encryption")
 
 
-# How much message history to backfill when a portal is first created —
-# every bridge type ships this OFF or ON differently by default (confirmed
-# against each bridge's actual example-config.yaml this session): Discord
-# defaults to fully disabled (0), while WhatsApp/Slack already default to
-# unlimited. Offered as a one-time choice during 'setup' (a fresh config
-# only — see cmd_setup) instead of leaving everyone to discover and hand-edit
-# this after the fact. Each bridge type's schema is completely different
-# (bridgev2 unified nothing here), so this is a real per-type table, not one
-# generic knob.
+# How much message history to backfill when a portal is first created, AND
+# how many conversations (including DMs) get a room created right away on
+# login instead of waiting for the first message — every bridge type ships
+# these OFF or ON differently by default (confirmed against each bridge's
+# actual example-config.yaml/source this session): Discord defaults to fully
+# disabled (0) for message backfill, while WhatsApp/Slack already default to
+# unlimited; Discord also has a THIRD, separate knob for the DM/conversation
+# count itself (`startup_private_channel_create_limit`, default 5) that
+# WhatsApp/Slack don't need because their single `conversation_count`/
+# `max_initial_conversations` field already does double duty as both "how
+# many conversations" and "how much shows up at once" (confirmed in
+# mautrix/slack's client.go: a plain count, negative means unlimited, 0 just
+# means nothing is created up front — new messages still create a portal on
+# demand either way, same as Discord's own "other portals will be created
+# when receiving messages"). Offered as a one-time choice during 'setup' (a
+# fresh config only — see cmd_setup) instead of leaving everyone to discover
+# and hand-edit this after the fact. Each bridge type's schema is completely
+# different (bridgev2 unified nothing here), so this is a real per-type
+# table, not one generic knob. Discord's "dm_limit" has no real unlimited
+# value (unlike the other two fields, `i < limit` in user.go never matches a
+# negative limit, so -1 would mean *zero* portals, not all of them) — a large
+# sentinel is used instead to approximate "all".
 BACKFILL_PRESETS = {
     "discord": {
-        "none": {"initial": (0, 0, 0), "missed": (0, 0, 0)},
-        "limited": {"initial": (20, 20, 0), "missed": (-1, -1, -1)},
-        "all": {"initial": (500, 500, 0), "missed": (-1, -1, -1)},
+        "none": {"initial": (0, 0, 0), "missed": (0, 0, 0), "dm_limit": 0},
+        "limited": {"initial": (20, 20, 0), "missed": (-1, -1, -1), "dm_limit": 20},
+        "all": {"initial": (500, 500, 0), "missed": (-1, -1, -1), "dm_limit": 9999},
     },
     "whatsapp": {
         "none": {"max_initial_conversations": 0},
@@ -1055,6 +1088,14 @@ def apply_backfill_preset(cfg_file: Path, bridge_type: str, preset: str) -> bool
         text = _replace_indented_triplet(text, "initial", dm, channel, thread)
         dm, channel, thread = fields["missed"]
         text = _replace_indented_triplet(text, "missed", dm, channel, thread)
+        span = _section_span(text, "bridge")
+        if span:
+            section_text, n = re.subn(
+                r"(?m)^(\s*)startup_private_channel_create_limit:\s*.*$",
+                lambda m: f"{m.group(1)}startup_private_channel_create_limit: {fields['dm_limit']}",
+                text[span[0]:span[1]], count=1,
+            )
+            text = text[:span[0]] + section_text + text[span[1]:] if n else text
     elif bridge_type == "whatsapp":
         span = _section_span(text, "history_sync")
         if span:
@@ -1085,7 +1126,7 @@ def maybe_reconfigure_backfill(cfg_file: Path, bridge_type: str) -> None:
     made earlier (by this same prompt, or by hand)."""
     if bridge_type not in BACKFILL_PRESETS:
         return
-    if not confirm(f"\nQuer ajustar quanto histórico a ponte de {bridge_type} carrega em conversas novas?", default=False):
+    if not confirm(f"\nQuer ajustar quantas conversas (incluindo DMs) e quanto histórico a ponte de {bridge_type} carrega de cara?", default=False):
         return
     preset = prompt_backfill_preset(bridge_type)
     if preset and apply_backfill_preset(cfg_file, bridge_type, preset):
@@ -1099,11 +1140,13 @@ def prompt_backfill_preset(bridge_type: str) -> str | None:
     if bridge_type not in BACKFILL_PRESETS:
         return None
     return choose(
-        "Quanto histórico carregar quando uma conversa for descoberta pela primeira vez?",
+        "Ao entrar pela primeira vez: quantas conversas (incluindo DMs) já aparecem "
+        "prontas, e quanto histórico de mensagens elas trazem? (conversas além do "
+        "limite não somem — só esperam a primeira mensagem nova pra aparecer)",
         [
-            ("none", "nada (padrão mais seguro/rápido — dá pra ajustar depois à mão em config.yaml)"),
-            ("limited", "um pouco (as últimas ~20 mensagens de cada conversa)"),
-            ("all", "tudo que der (primeira sincronização mais lenta/pesada)"),
+            ("none", "nenhuma conversa criada de cara, sem histórico (padrão mais seguro/rápido — dá pra ajustar depois à mão em config.yaml)"),
+            ("limited", "umas ~20 conversas (incluindo DMs), com as últimas ~20 mensagens cada"),
+            ("all", "todas as conversas e todo o histórico que der (primeira sincronização mais lenta/pesada)"),
         ],
         default="none",
     )
@@ -1238,24 +1281,14 @@ def apply_house_style(cfg_file: Path, bridge_type: str) -> bool:
             if n:
                 text = text[:appservice_span[0]] + section_text + text[appservice_span[1]:]
 
-        # mautrix-discord's own default (5) silently creates up to 5 DM/
-        # private-channel portals the moment you log in, with no prompt —
-        # confirmed live: a student logged in and immediately got an
-        # unexpected DM room open in Element ("Luiz Guilherme Nascimento")
-        # they never asked for. Every other portal (guilds, explicit DMs
-        # you open yourself) still bridges normally; this only stops the
-        # unsolicited auto-creation on login. whatsapp/slack don't have
-        # this setting.
-        if bridge_type == "discord":
-            bridge_span = _section_span(text, "bridge")
-            if bridge_span:
-                section_text, n = re.subn(
-                    r"(?m)^(\s*)startup_private_channel_create_limit:\s*.*$",
-                    lambda m: f"{m.group(1)}startup_private_channel_create_limit: 0",
-                    text[bridge_span[0]:bridge_span[1]], count=1,
-                )
-                if n:
-                    text = text[:bridge_span[0]] + section_text + text[bridge_span[1]:]
+    # mautrix-discord's `startup_private_channel_create_limit` (default 5)
+    # used to get capped to 0 here to stop a DM portal opening unprompted
+    # right after login — but 0 doesn't mean "only stop the surprise one",
+    # it means "sync no DMs at all on login", full stop (confirmed live: a
+    # student setting up the bridge fresh ended up with zero DMs, not just
+    # minus the unprompted one). That's strictly worse than the original
+    # annoyance, so this override was removed — leave mautrix-discord's own
+    # default in place. whatsapp/slack don't have this setting.
 
     # Without this, `m.direct` account data (what makes Element list a DM
     # portal under "People" instead of "Rooms") is never touched by the
