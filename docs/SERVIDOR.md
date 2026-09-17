@@ -43,19 +43,25 @@ do que você já pediu acima.
 
 ### Manual (recomendado): você mesmo faz, sem pedir nada a mais
 
-Gere um token de acesso **dedicado** pra ponte (não copie o token que o seu
-Element já está usando agora — usar o mesmo token em dois lugares causa
-problema de sincronização de chaves de criptografia):
+Este servidor delega login pro matrix-authentication-service (MAS) — não
+existe `m.login.password` aqui, só SSO (Google). Gere um token de acesso
+**dedicado** pra ponte (não copie o token que o seu Element já está usando
+agora — usar o mesmo token em dois lugares causa problema de sincronização
+de chaves de criptografia):
 
-```bash
-curl -XPOST -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"seu_usuario"},"password":"sua_senha","initial_device_display_name":"bridge-whatsapp"}' \
-  https://seu-dominio.com/_matrix/client/v3/login
-```
+Element → Configurações → Ajuda e sobre → Avançado → Access Token → revele
+e copie. **Atenção**: esse token é de curta duração sob MAS (confirmado
+nesta sessão — expira bem antes do que se esperaria de um token "normal"
+do Matrix) e pode até devolver `M_UNKNOWN_TOKEN (HTTP 401): Token is not
+active` já na primeira tentativa de uso sob carga do homeserver — se isso
+acontecer, tente de novo em alguns segundos antes de assumir que o token
+está errado. Se ele expirar com frequência, peça ao administrador do
+servidor pra gerar um token de longa duração de verdade com
+`mas-cli manage issue-compatibility-token <seu_usuario> <device_id>`
+(exige acesso de admin ao MAS, então só ele pode rodar isso).
 
-(Se você só usa SSO, veja o passo "Manualmente com SSO" na
-[doc oficial](https://docs.mau.fi/bridges/general/double-puppeting.html).)
-
-Isso devolve um `access_token`. Na sala de gerenciamento da ponte, mande:
+Isso devolve um `access_token` (ou o token que você copiou do Element). Na
+sala de gerenciamento da ponte, mande:
 
 ```
 login-matrix <o access_token>
@@ -93,24 +99,27 @@ dp_secret`) e trate-o como mais sensível que o `as_token` da sua própria
 ponte — ele pode agir como qualquer conta que o administrador tiver incluído
 no namespace dele.
 
-### Pontes legadas (mautrix-discord, por exemplo): nem o comando manual existe
+### Pontes legadas (mautrix-discord, por exemplo): o manual funciona, só o automático que não
 
-`mautrix-discord` (e outras pontes que ainda não migraram pro framework
-bridgev2) não implementa o comando `login-matrix` — mandar esse comando na
-sala de gerenciamento é ignorado em silêncio, não é erro nem falta de
-permissão sua, o comando simplesmente não existe nessa ponte (confirmado
-lendo o código-fonte dela). O único método automático disponível pra essas
-pontes é ainda mais amplo que o `as_token` de namespace restrito acima: usa
-um segredo único do Synapse inteiro
+`login-matrix`/`logout-matrix`/`ping-matrix` são comandos genéricos do
+próprio framework mautrix-go, não algo exclusivo do bridgev2 — confirmado
+lendo os símbolos do binário instalado (`mautrix-discord` v0.7.7): as três
+strings de comando e as mensagens de uso/confirmação (`` `login-matrix
+<access token>` ``, "Confirmed valid access token for...", "You don't have
+double puppeting enabled.") estão todas lá. Uma versão desta doc chegou a
+dizer o contrário — estava desatualizada, corrigido aqui. O que essas pontes
+legadas **não têm** é o método automático de appservice de namespace restrito
+descrito acima (esse sim é exclusivo do bridgev2). Pra elas, o único jeito
+automático disponível é ainda mais amplo que o `as_token` de namespace
+restrito: usa um segredo único do Synapse inteiro
 ([`matrix-synapse-shared-secret-auth`](https://github.com/devture/matrix-synapse-shared-secret-auth))
 que autentica como **qualquer conta que já exista no servidor**, sem
 distinção nenhuma por namespace — não dá pra restringir a uma conta
 específica como no método `as_token`. Não recomendamos usar isso: o ganho
-(não precisar aceitar convite/copiar token manualmente) não compensa colocar
-uma chave-mestra do servidor dentro do `config.yaml` da ponte, que fica em
-texto claro no seu computador. Viva sem double puppeting automático nessas
-pontes — o pior efeito colateral é ter que aceitar manualmente o convite de
-conversas novas de vez em quando.
+(não precisar rodar `login-matrix` de novo quando o token expirar) não
+compensa colocar uma chave-mestra do servidor dentro do `config.yaml` da
+ponte, que fica em texto claro no seu computador. Use o método manual acima
+mesmo nessas pontes — funciona igual.
 
 ### O que nenhum dos dois resolve
 
