@@ -39,11 +39,15 @@ ponto; Slack/WhatsApp já vêm sem limite). Pra mudar depois, edite
 
 Para essas mesmas três pontes, `setup` também aplica sem perguntar (padrão
 do projeto): um sufixo de plataforma no nome dos fantasmas (`Nome Sobrenome
-(discord)`/`(slack)`/`(wapp)`), o space "geral" desativado no Slack/WhatsApp
-(o do Discord não tem essa opção — é fixo no próprio binário da ponte), e
-**end-to-end encryption ligada** (`encryption.allow`, sem o que o bot não
-consegue entrar em salas que o Element já cria criptografadas por padrão).
-Numa config já existente, `setup` pergunta antes de aplicar esses ajustes.
+(discord)`/`(slack)`/`(wapp)`) e o space "geral" desativado no Slack/WhatsApp
+(o do Discord não tem essa opção — é fixo no próprio binário da ponte).
+**End-to-end encryption** (`encryption.allow`/`default`, mais MSC4190 —
+exigido por este servidor usar MAS, ver docs/SERVIDOR.md) é ligada
+automaticamente pra **qualquer** ponte que tenha seção `encryption:`, não só
+essas três — sem isso o bot não consegue entrar em salas que o Element já
+cria criptografadas por padrão, nem completar o próprio login do appservice
+neste servidor. Numa config já existente, `setup` pergunta antes de aplicar
+qualquer um desses ajustes.
 
 Para **Discord, Slack e WhatsApp**, `setup` já busca um registro pré-feito no
 servidor (usando o token de API de `vpn-init`) — não precisa mandar nada pro
