@@ -121,6 +121,43 @@ compensa colocar uma chave-mestra do servidor dentro do `config.yaml` da
 ponte, que fica em texto claro no seu computador. Use o método manual acima
 mesmo nessas pontes — funciona igual.
 
+### O que quebra quando o token expira (e como perceber)
+
+Quando o token de double puppeting expira ou é revogado — o que, pela seção
+acima, é esperado acontecer de tempos em tempos sob MAS — a ponte não avisa
+ativamente que isso aconteceu. Os sintomas que você vai ver em vez disso,
+confirmados ao vivo nesta sessão com o Slack:
+
+- **DMs que já existiam no Matrix somem de "Pessoas" no Element** (ou nunca
+  chegam a aparecer lá, ficando só na lista geral de salas). O código da
+  ponte (`bridgev2`) só marca uma sala como DM (`m.direct`) durante uma
+  ressincronização de conversa (`ChatResync`), e essa marcação **exige** que
+  o double puppeting esteja ativo *naquele exato momento* — se a sala foi
+  criada (ou a última ressincronização aconteceu) com o token expirado, a
+  marcação falha silenciosamente e **não existe nenhuma nova tentativa
+  automática depois** disso. Renovar o token com `login-matrix` não
+  reprocessa sozinho as salas já existentes.
+- **Mensagens não decifram** ("Unable to decrypt message" / UTD) mais do que
+  o normal, ou passam a acontecer justo depois de renovar o `login-matrix` —
+  o double puppeting é mais um "dispositivo" logado como você (ver seção 4),
+  então cada vez que ele troca de token é, pro Matrix, um dispositivo novo
+  entrando, com todo o potencial de dessincronia de chave que isso implica.
+
+**Como resolver depois de já ter corrigido o double puppeting** (token válido,
+`login-matrix` confirmado): force uma nova ressincronização, que é o que
+dispara a marcação de "Pessoas" de novo. Duas formas:
+
+- **Uma sala específica**: mande `sync-portal` na própria sala da ponte (sem
+  precisar sair e reentrar, sem restart de nada) — o comando existe
+  justamente pra isso (buscar as informações da conversa de novo e reaplicar
+  `UpdateInfo`, incluindo a marcação de DM).
+- **Todas de uma vez**: reinicie o processo da ponte
+  (`systemctl --user restart mautrix-bridge@<ponte>`) — no login inicial ela
+  ressincroniza todas as conversas, então isso tem o mesmo efeito do
+  `sync-portal` em cada sala, só que mais lento (o Synapse aplica
+  rate-limit — é normal ver `HTTP 429` no log durante isso, ele mesmo tenta
+  de novo sozinho).
+
 ### O que nenhum dos dois resolve
 
 Nem o método manual nem o automático mudam o fato de que quem administra o
