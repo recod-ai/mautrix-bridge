@@ -32,33 +32,33 @@ preenchidos como default).
 
 Numa config nova, `setup` também pergunta quanto histórico carregar quando
 uma conversa for descoberta pela primeira vez (nada / um pouco / tudo que
-der) — vale para Discord, Slack e WhatsApp, cada um com seu próprio jeito de
-guardar isso no `config.yaml` (o Discord vem desligado por padrão nesse
-ponto; Slack/WhatsApp já vêm sem limite). Pra mudar depois, edite
-`config.yaml` à mão (`backfill:`/`history_sync:`, dependendo da ponte).
+der) — vale para Discord, Slack, WhatsApp e Signal, cada um com seu próprio
+jeito de guardar isso no `config.yaml` (o Discord vem desligado por padrão
+nesse ponto; Slack/WhatsApp/Signal já vêm sem limite). Pra mudar depois,
+edite `config.yaml` à mão (`backfill:`/`history_sync:`, dependendo da ponte).
 
-Para essas mesmas três pontes, `setup` também aplica sem perguntar (padrão
+Para essas mesmas quatro pontes, `setup` também aplica sem perguntar (padrão
 do projeto): um sufixo de plataforma no nome dos fantasmas (`Nome Sobrenome
-(discord)`/`(slack)`/`(wapp)`) e o space "geral" desativado no Slack/WhatsApp
-(o do Discord não tem essa opção — é fixo no próprio binário da ponte).
-**End-to-end encryption** (`encryption.allow`/`default`, mais MSC4190 —
-exigido por este servidor usar MAS, ver docs/SERVIDOR.md) é ligada
-automaticamente pra **qualquer** ponte que tenha seção `encryption:`, não só
-essas três — sem isso o bot não consegue entrar em salas que o Element já
-cria criptografadas por padrão, nem completar o próprio login do appservice
-neste servidor. Numa config já existente, `setup` pergunta antes de aplicar
-qualquer um desses ajustes.
+(discord)`/`(slack)`/`(wapp)`/`(signal)`) e o space "geral" desativado no
+Slack/WhatsApp/Signal (o do Discord não tem essa opção — é fixo no próprio
+binário da ponte). **End-to-end encryption** (`encryption.allow`/`default`,
+mais MSC4190 — exigido por este servidor usar MAS, ver docs/SERVIDOR.md) é
+ligada automaticamente pra **qualquer** ponte que tenha seção `encryption:`,
+não só essas quatro — sem isso o bot não consegue entrar em salas que o
+Element já cria criptografadas por padrão, nem completar o próprio login do
+appservice neste servidor. Numa config já existente, `setup` pergunta antes
+de aplicar qualquer um desses ajustes.
 
-Para **Discord, Slack e WhatsApp**, `setup` já busca um registro pré-feito no
-servidor (usando o token de API de `vpn-init`) — não precisa mandar nada pro
-administrador, é só ligar o serviço:
+Para **Discord, Slack, WhatsApp e Signal**, `setup` já busca um registro
+pré-feito no servidor (usando o token de API de `vpn-init`) — não precisa
+mandar nada pro administrador, é só ligar o serviço:
 
 ```bash
 systemctl --user enable --now mautrix-bridge@slack
 journalctl --user -u mautrix-bridge@slack -f
 ```
 
-Para qualquer outra ponte (Telegram, Signal, Teams, ...), `setup` gera um
+Para qualquer outra ponte (Telegram, Teams, ...), `setup` gera um
 registro novo do zero, e você ainda precisa mandar pro administrador:
 
 ```bash
@@ -117,7 +117,7 @@ Tráfego de appservice tem duas direções, e só uma delas é o problema:
   segredo nenhum, é como qualquer cliente Matrix.
 - **Synapse → ponte** (o POST que entrega eventos, é *push*): o Synapse
   precisa alcançar a URL do `registration.yaml`. Como a ponte roda no seu
-  computador atrás de NAT (é assim que o tráfego do Discord/Slack/WhatsApp
+  computador atrás de NAT (é assim que o tráfego do Discord/Slack/WhatsApp/Signal
   sai com IP residencial, não IP de datacenter), essa direção não funciona
   sem ajuda — a solução é uma **VPN WireGuard** entre as duas máquinas, só
   pra essa chamada de volta.
@@ -199,15 +199,15 @@ A unit do systemd roda `bridgectl update <ponte>` a cada início e reinício:
 Para congelar uma ponte, ponha `update_cooldown = 31536000` nela no
 `bridges.toml`.
 
-## Double puppeting: manual nas três pontes, de propósito
+## Double puppeting: manual nas pontes do pool, de propósito
 
 Escolhemos o método manual (`login-matrix`, ver
-[docs/SERVIDOR.md](docs/SERVIDOR.md) seção 3) para Slack, Discord e
-WhatsApp — não o automático (que exigiria o administrador registrar um
+[docs/SERVIDOR.md](docs/SERVIDOR.md) seção 3) para Slack, Discord, WhatsApp
+e Signal — não o automático (que exigiria o administrador registrar um
 segundo appservice pra sua conta, ou pior, uma chave-mestra do servidor
 inteiro nas pontes legadas). É a mesma troca de segurança de sempre,
-generalizada pras três: menos automação em troca de nenhum segredo com poder
-sobre a conta de outra pessoa em texto claro no seu notebook.
+generalizada pras quatro: menos automação em troca de nenhum segredo com
+poder sobre a conta de outra pessoa em texto claro no seu notebook.
 
 **Efeito colateral aceito**: sem o appservice automático, um Synapse comum
 não anuncia a capability `BeeperAutoJoinInvites` (exclusiva do Beeper), e a

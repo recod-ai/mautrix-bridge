@@ -1049,6 +1049,16 @@ BACKFILL_PRESETS = {
         "limited": {"conversation_count": 20},
         "all": {"conversation_count": -1},
     },
+    # Signal's own config.yaml comment is explicit that zero-or-negative
+    # DISABLES backfill in new rooms for max_initial_messages (the opposite
+    # of whatsapp/slack's -1-means-unlimited convention) — a large sentinel
+    # for "all" avoids relying on -1 meaning something it doesn't here,
+    # same reasoning as Discord's own dm_limit sentinel above.
+    "signal": {
+        "none": {"max_initial_messages": 0, "max_catchup_messages": 0},
+        "limited": {"max_initial_messages": 20, "max_catchup_messages": 20},
+        "all": {"max_initial_messages": 500, "max_catchup_messages": 9999},
+    },
 }
 
 
@@ -1125,8 +1135,26 @@ def apply_backfill_preset(cfg_file: Path, bridge_type: str, preset: str) -> bool
                 text[span[0]:span[1]], count=1,
             )
             text = text[:span[0]] + section_text + text[span[1]:] if n else text
+    elif bridge_type == "signal":
+        # Unlike Slack, both fields live directly in the shared top-level
+        # backfill: block (no separate per-connector nested one) — same
+        # block the "enabled" master switch below also lives in.
+        span = _section_span(text, "backfill")
+        if span:
+            section_text = text[span[0]:span[1]]
+            section_text, n1 = re.subn(
+                r"(?m)^(\s*)max_initial_messages:\s*.*$",
+                lambda m: f"{m.group(1)}max_initial_messages: {fields['max_initial_messages']}",
+                section_text, count=1,
+            )
+            section_text, n2 = re.subn(
+                r"(?m)^(\s*)max_catchup_messages:\s*.*$",
+                lambda m: f"{m.group(1)}max_catchup_messages: {fields['max_catchup_messages']}",
+                section_text, count=1,
+            )
+            text = text[:span[0]] + section_text + text[span[1]:] if (n1 or n2) else text
 
-    if bridge_type in ("whatsapp", "slack"):
+    if bridge_type in ("whatsapp", "slack", "signal"):
         # Separate master switch (shared bridgev2 top-level `backfill:`
         # section, column 0 — the one _section_span actually reaches here)
         # that has to be on for ANY message history to come through at all,
@@ -1195,6 +1223,8 @@ DISPLAYNAME_TEMPLATES = {
                  '\'{{or .BusinessName .PushName .Phone .RedactedPhone "Unknown user"}} (wapp)\''),
     "slack": ("network", "displayname_template",
               "'{{or .Profile.DisplayName .Profile.RealName .Name}}{{if .IsBot}} (bot){{end}} (slack)'"),
+    "signal": ("network", "displayname_template",
+               '\'{{or .ProfileName .PhoneNumber "Unknown user"}} (signal)\''),
 }
 
 # WhatsApp/Slack (bridgev2) can drop the umbrella "everything" space while
@@ -1205,7 +1235,7 @@ DISPLAYNAME_TEMPLATES = {
 # hardcoded in user.go/guildportal.go, so there's nothing to patch there;
 # leaving that one space once (as its owner already found out how to do) is
 # the only option short of forking the bridge itself.
-DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack"}
+DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack", "signal"}
 
 # End-to-end encryption, on by default for all three pool bridge types —
 # Element already encrypts new private/DM rooms by default, and without this
@@ -1440,7 +1470,7 @@ def resync_config(cfg_file: Path, server: dict) -> bool:
 # bridge-pool.js no repo agorae e docs/ADICIONAR-PONTE.md "Pool de pontes") —
 # pra essas, 'setup' busca credenciais reais do servidor em vez de gerar (e
 # precisar mandar pro administrador) as suas próprias.
-POOL_BRIDGE_TYPES = {"discord", "slack", "whatsapp"}
+POOL_BRIDGE_TYPES = {"discord", "slack", "whatsapp", "signal"}
 
 
 def fetch_pool_slot(cfg: dict, bridge_type: str) -> dict | None:
