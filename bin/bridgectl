@@ -1740,8 +1740,13 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
         # even with config.yaml's own msc4190: true already set.
         if _encryption_span(cfg_file.read_text(), b["repo"]) is not None:
             reg_text = reg_file.read_text()
-            if "io.element.msc4190:" not in reg_text:
-                reg_file.write_text(reg_text.rstrip("\n") + "\nio.element.msc4190: true\n")
+            # msc3202 pairs with encryption.appservice: without it Synapse never
+            # reports this user's new devices to the bridge, so keys aren't
+            # shared with them ("Unable to decrypt message" on newer sessions)
+            for flag in ("io.element.msc4190", "org.matrix.msc3202"):
+                if f"{flag}:" not in reg_text:
+                    reg_text = reg_text.rstrip("\n") + f"\n{flag}: true\n"
+            reg_file.write_text(reg_text)
         os.chmod(reg_file, 0o600)
         log(f"{args.name}: registration.yaml gerado")
     else:
