@@ -1511,6 +1511,35 @@ def fetch_pool_slot(cfg: dict, bridge_type: str) -> dict | None:
         return None
 
 
+def apply_double_puppet(cfg_file: Path, domain: str) -> str:
+    """Liga o double puppeting automático usando o as_token do próprio slot.
+
+    O servidor só aceita isso porque o registration do slot lista o MXID do dono
+    como namespace não exclusivo (playbook bridge-owner-namespace.yml no agorae).
+    Troca só a entrada de exemplo do config (`example.com: ...`), no bloco onde
+    cada tipo de ponte guarda isso: `double_puppet.secrets` (bridgev2) ou
+    `bridge.login_shared_secret_map` (discord). Devolve "set", "already",
+    "custom" (já existe outro valor pro domínio — não mexe) ou "missing"."""
+    text = cfg_file.read_text()
+    wanted = f'{domain}: "as_token:${{keyring:as_token}}"'
+    for section, key in (("double_puppet", "secrets"), ("bridge", "login_shared_secret_map")):
+        span = _section_span(text, section)
+        if not span:
+            continue
+        m = re.search(rf"(?m)^[ \t]*{key}:[ \t]*\n[ \t]+(\S[^\n]*)\n", text[span[0]:span[1]])
+        if not m:
+            continue
+        entry = m.group(1)
+        if entry == wanted:
+            return "already"
+        if not entry.startswith("example.com:"):
+            return "custom"
+        start = span[0] + m.start(1)
+        cfg_file.write_text(text[:start] + wanted + text[start + len(entry):])
+        return "set"
+    return "missing"
+
+
 def apply_pool_config(cfg_file: Path, pool_slot: dict, server: dict) -> None:
     """Aponta config.yaml pra escutar exatamente onde a `url` do slot promete
     ao Synapse, e usa o username_template/bot_username reservados só pra esse
@@ -1684,6 +1713,7 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
     # domínio inteiro (ver permissions_scoped_to_owner acima) — reaplica o
     # slot do pool de novo pra estreitar isso, mesmo com os ids já batendo.
     pool_slot = fetch_pool_slot(cfg, b["repo"])
+    fetched_slot = pool_slot
     existing_reg_id = registered_id(reg_file) if reg_file.exists() else None
     existing_cfg_id = configured_appservice_id(cfg_file) if cfg_file.exists() else None
     ids_match = existing_reg_id == pool_slot["id"] and existing_cfg_id == pool_slot["id"] if pool_slot else False
@@ -1751,6 +1781,15 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
         log(f"{args.name}: registration.yaml gerado")
     else:
         log(f"{args.name}: registration.yaml já existe, mantido")
+
+    if fetched_slot and fetched_slot.get("owner_mxid") and server.get("homeserver_domain"):
+        state = apply_double_puppet(cfg_file, server["homeserver_domain"])
+        log({
+            "set": f"{args.name}: double puppeting automático ligado (as_token do slot, só pra {fetched_slot['owner_mxid']})",
+            "already": f"{args.name}: double puppeting automático já estava ligado",
+            "custom": f"{args.name}: o config já tem outro segredo de double puppeting pra {server['homeserver_domain']} — mantido",
+            "missing": f"{args.name}: não achei onde configurar double puppeting no config.yaml — ligue à mão",
+        }[state])
 
     cmd_harvest(cfg, argparse.Namespace(name=args.name, file=str(cfg_file), keys=None, prefix=False))
     cmd_harvest(cfg, argparse.Namespace(name=args.name, file=str(reg_file), keys=None, prefix=False))
