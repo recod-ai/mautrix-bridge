@@ -1501,6 +1501,13 @@ def fetch_pool_slot(cfg: dict, bridge_type: str) -> dict | None:
         if e.code == 409:
             die(f"pool de {bridge_type} esgotado no servidor — avise o administrador pra "
                 f"expandir em /admin (seção 'Pool de pontes')")
+        if e.code == 423:
+            try:
+                detail = json.load(e).get("error", "")
+            except (ValueError, OSError):
+                detail = ""
+            die(detail or f"{bridge_type}: aguardando liberação do administrador — avise-o e rode "
+                          f"'bridgectl setup {bridge_type}' de novo depois")
         if e.code == 401:
             die("token de API do propylaia inválido ou ausente — rode 'bridgectl vpn-init' "
                 "de novo e cole o token atual mostrado em /propylaia")
