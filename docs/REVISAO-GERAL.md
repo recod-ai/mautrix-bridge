@@ -349,6 +349,22 @@ Por ordem de custo-benefício:
 
 ---
 
+## 8.1 Status das recomendações (atualizado em 2026-09-21)
+
+| # | Recomendação | Status |
+|---|---|---|
+| 1 | `./install.sh` | **Feito.** O `bridgectl` instalado é idêntico ao do repositório. |
+| 2 | Canal `release` / fixar versão | **Feito, de outra forma.** `auto_update = false` em `[defaults]`: reiniciar não troca mais o binário. Trocar para `release` não foi feito: a última release (`v0.2609.0` no Slack/Signal, `v0.7.7` no Discord) pode ser mais antiga que o build `ci` instalado, e os bancos (versão 30 no Slack e no Signal) já foram migrados por ele — não verifiquei que a release os abriria. A versão só muda com `bridgectl update <ponte>`. |
+| 3 | Log em `info` e limpar `logs/` | **Feito.** `setup` rebaixa `debug` para `info` (sem mexer em quem já escolheu outro nível). Logs rotacionados apagados nas três pontes e no WhatsApp (o arquivo ativo de cada uma ficou). O journal do systemd (~680 MB) não foi tocado. |
+| 4 | Apagar `.orig`, `slack.db.bak-*`, `share/*.bak-*` | **Feito**, exceto os dados de sessão do WhatsApp (`~/.local/share/mautrix-bridges/whatsapp`, 16 MB), mantidos até decidir o futuro dessa ponte. Também saíram as cópias de config que este trabalho gerou. Os valores literais de `signing_key`/`server_key` do Signal foram para o chaveiro. |
+| 5 | Double puppeting | **Feito**, por outro caminho: `as_token` do slot (README, "Double puppeting automático"), nas três pontes. |
+| 6 | Desabilitar a unit do WhatsApp | **Feito** (`disable --now`). |
+| 7 | `appservice.hostname` na VPN | **Feito** no Discord e no Slack; `apply_pool_config` passa a usar o IP da `url` do slot em vez de `0.0.0.0`. As três escutam só em `10.10.0.2`. |
+| 8 | `allow_key_sharing` uniforme | **Feito** (`true` nas três; o padrão da casa aplica). |
+| 9 | Backup periódico | **Feito.** `bridgectl backup` (API de backup do SQLite) e `mautrix-backup.timer` diário, 0600 em dir 0700, 3 cópias por banco. As cópias têm as mesmas sessões em texto puro dos bancos vivos. |
+| 10 | Dispositivos antigos dos bots | **Feito** pela API de admin: ficou só o dispositivo atual em cada bot (removidos 4 do Discord, 1 do Signal, 1 do Slack). |
+| 11 | Melhorias no `bridgectl` | **Feito em parte:** `doctor`, `setup` que reaplica o slot quando o registration local não tem o namespace do dono, `harvest` das chaves literais de mídia, e testes (`tests/`). **Não feito:** `harvest` dos valores `generate` (`avatar_proxy_key`, `server_key`, `signing_key` do Slack e do Discord, que continuam sendo recriados a cada início; `server_key` tem formato ed25519 e um hex aleatório não serve; impacto baixo com mídia direta/pública desligada) e um comando de reset de criptografia. |
+
 ## 9. Como reproduzir esta leitura
 
 ```bash

@@ -161,3 +161,12 @@ def test_house_style_never_joins_lines(tmp_path):
     f.write_text(CONFIG.replace("    allow_key_sharing: false\n", "    allow_key_sharing: false\n\n    # a comment\n    other: 1\n"))
     bc.apply_house_style(f, "slack")
     assert "    allow_key_sharing: true\n\n    # a comment\n    other: 1\n" in f.read_text()
+
+
+def test_registration_owner_namespace_detection():
+    with_ns = "namespaces:\n  users:\n    - exclusive: true\n      regex: '@slack_s003_.+:agorae\\.dedyn\\.io'\n    - exclusive: false\n      regex: '@ana\\.souza:agorae\\.dedyn\\.io'\n"
+    without = with_ns.split("    - exclusive: false")[0]
+    assert bc.registration_has_owner_namespace(with_ns, "@ana.souza:agorae.dedyn.io")
+    assert not bc.registration_has_owner_namespace(without, "@ana.souza:agorae.dedyn.io")
+    assert not bc.registration_has_owner_namespace(with_ns, "@bia:agorae.dedyn.io")  # only that exact account
+    assert bc.registration_has_owner_namespace(without, None)  # no owner known: nothing to require

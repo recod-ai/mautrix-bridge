@@ -1766,7 +1766,11 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
         not pool_slot.get("owner_mxid")
         or permissions_scoped_to_owner(cfg_file, server.get("homeserver_domain"))
     ) if (pool_slot and cfg_file.exists()) else True
-    in_sync = ids_match and perms_scoped
+    owner_ns_ok = (
+        registration_has_owner_namespace(reg_file.read_text(), pool_slot.get("owner_mxid"))
+        if (pool_slot and reg_file.exists()) else True
+    )
+    in_sync = ids_match and perms_scoped and owner_ns_ok
 
     if pool_slot and in_sync:
         pool_slot = None  # já é o slot certo dos dois lados, nada a fazer
@@ -1779,15 +1783,19 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
                   f"config.yaml: {existing_cfg_id}) não bate com o slot do pool pré-registrado (id: "
                   f"{pool_slot['id']}) — geralmente porque foi gerado (ou ajustado por uma versão mais "
                   f"antiga do bridgectl) antes disso ser corrigido. O Synapse não reconhece esse estado.")
-        else:
+        elif not perms_scoped:
             print(f"\n{args.name}: bridge.permissions ainda libera \"{server.get('homeserver_domain')}\": "
                   f"user (todo aluno do domínio, não só você) — config gerado antes desse ajuste existir. "
                   f"Não afeta o Synapse, mas deixa esse bot aceitando comando de qualquer aluno, não só "
                   f"{pool_slot.get('owner_mxid', 'você')}.")
+        else:
+            print(f"\n{args.name}: o registration.yaml local não lista {pool_slot.get('owner_mxid')} como namespace "
+                  f"do dono (double puppeting) — foi gerado antes disso existir. Reaplicar o slot traz a versão atual.")
         if not confirm(f"Corrigir pro slot do pool ({pool_slot['id']})?", default=True):
             log(f"{args.name}: mantido como está "
                 + ("(pode continuar dando erro de token/ID)" if not ids_match else
-                   "(bridge.permissions continua liberado pro domínio inteiro)"))
+                   "(bridge.permissions continua liberado pro domínio inteiro)" if not perms_scoped else
+                   "(o registration.yaml local continua sem o namespace do dono)"))
             pool_slot = None
 
     if pool_slot:
@@ -1913,6 +1921,15 @@ def cmd_backup(cfg: dict, args: argparse.Namespace) -> int:
     return rc
 
 
+def registration_has_owner_namespace(text: str, owner_mxid: str | None) -> bool:
+    """O registration lista o dono como namespace NÃO exclusivo (é o que deixa o
+    as_token do slot agir como ele — double puppeting)."""
+    if not owner_mxid:
+        return True
+    esc = owner_mxid.replace(".", "\\.")
+    return re.search(rf"exclusive:\s*false\s*\n\s*regex:\s*'{re.escape(esc)}'", text) is not None
+
+
 def _value_in(text: str, section: str, key: str) -> str | None:
     span = _section_span(text, section)
     if not span:
@@ -1939,8 +1956,7 @@ def doctor_checks(name: str, b: dict, server: dict, cfg_text: str, reg_text: str
         missing = [f for f in ("io.element.msc4190", "org.matrix.msc3202", "receive_ephemeral") if f"{f}: true" not in reg_text]
         (fail if missing else ok)(f"registration.yaml sem {', '.join(missing)}" if missing else "registration.yaml declara msc4190, msc3202 e receive_ephemeral")
         if pool and owner:
-            esc = owner.replace(".", "\\.")
-            has = re.search(rf"exclusive:\s*false\s*\n\s*regex:\s*'{re.escape(esc)}'", reg_text) is not None
+            has = registration_has_owner_namespace(reg_text, owner)
             (ok if has else warn)("namespace do dono no registration (double puppeting)" if has
                                   else f"registration.yaml sem o namespace de {owner} — sem double puppeting até o admin liberar")
 
