@@ -17,6 +17,10 @@ channel = "release"
 # segundos mínimos entre duas checagens de atualização (evita martelar o servidor
 # quando o systemd fica reiniciando a ponte em loop)
 update_cooldown = 900
+# false = reiniciar a ponte NÃO troca o binário (o ExecStartPre vira no-op); a versão
+# só muda quando você roda 'bridgectl update <ponte>'. Recomendado com channel = "ci":
+# um reinício qualquer pode trazer código ainda não lançado.
+auto_update = false
 # chave usada só para testar se o cofre já está destrancado antes de subir
 keyring_probe = "as_token"
 keyring_wait = 120

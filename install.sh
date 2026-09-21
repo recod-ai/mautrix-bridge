@@ -13,6 +13,8 @@ mkdir -p "$BIN" "$CFG" "$UNITS" \
 
 install -m 0755 "$SRC/bin/bridgectl" "$BIN/bridgectl"
 install -m 0644 "$SRC/systemd/mautrix-bridge@.service" "$UNITS/mautrix-bridge@.service"
+install -m 0644 "$SRC/systemd/mautrix-backup.service" "$UNITS/mautrix-backup.service"
+install -m 0644 "$SRC/systemd/mautrix-backup.timer" "$UNITS/mautrix-backup.timer"
 
 if [[ -e "$CFG/bridges.toml" ]]; then
     echo "==> $CFG/bridges.toml já existe, mantido como está"
@@ -25,6 +27,7 @@ chmod 700 "$CFG" \
     "${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-bridges" \
     "${XDG_STATE_HOME:-$HOME/.local/state}/mautrix-bridges"
 systemctl --user daemon-reload
+systemctl --user enable --now mautrix-backup.timer
 
 echo
 echo "Instalado. Próximos passos: ver README.md (seção 'Uso')."

@@ -1,0 +1,10 @@
+; ~/.config/systemd/user/mautrix-backup.service
+;
+; Copia os bancos SQLite das pontes (chaves Megolm + sessões) para
+; ~/.local/share/mautrix-bridges/backups/<ponte>/, modo 0600, só as 3 mais novas.
+[Unit]
+Description=Backup dos bancos das pontes mautrix
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/bridgectl backup --all --quiet

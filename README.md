@@ -196,26 +196,53 @@ A unit do systemd roda `bridgectl update <ponte>` a cada início e reinício:
   (sem escopo nenhum já serve) em `~/.config/mautrix-bridges/environment`
   como `GITHUB_TOKEN=...` pra subir pra 5000/h.
 
-Para congelar uma ponte, ponha `update_cooldown = 31536000` nela no
-`bridges.toml`.
+**Fixar a versão:** `auto_update = false` em `[defaults]` (ou numa ponte)
+faz o `ExecStartPre` virar um no-op — reiniciar a ponte deixa de trocar o
+binário, o que importa com `channel = "ci"` (qualquer reinício podia trazer
+código ainda não lançado). A versão só muda quando você roda, de propósito,
+`bridgectl update <ponte>` (sem `--quiet`). `bridgectl status` mostra o que
+está instalado. Trocar de `ci` para `release` não é seguro sem conferir: a
+release pode ser mais antiga que o build instalado e não abrir um banco já
+migrado por ele.
 
-## Double puppeting: manual nas pontes do pool, de propósito
+## Double puppeting automático (as_token do slot)
 
-Escolhemos o método manual (`login-matrix`, ver
-[docs/SERVIDOR.md](docs/SERVIDOR.md) seção 3) para Slack, Discord, WhatsApp
-e Signal — não o automático (que exigiria o administrador registrar um
-segundo appservice pra sua conta, ou pior, uma chave-mestra do servidor
-inteiro nas pontes legadas). É a mesma troca de segurança de sempre,
-generalizada pras quatro: menos automação em troca de nenhum segredo com
-poder sobre a conta de outra pessoa em texto claro no seu notebook.
+Sem double puppeting a ponte não age como você no Matrix: as DMs não entram em
+"People", a leitura não sincroniza e o que você manda pelo app do Slack/Discord
+aparece como o fantasma. O `login-matrix` não serve com o MAS (o único token
+copiável dura 5 minutos). O que funciona é a ponte usar o `as_token` do
+próprio slot para agir como o dono:
 
-**Efeito colateral aceito**: sem o appservice automático, um Synapse comum
-não anuncia a capability `BeeperAutoJoinInvites` (exclusiva do Beeper), e a
-ponte não tenta entrar sozinha nas salas que te convida — é preciso aceitar
-manualmente. Isso não é um bug: é a consequência direta de não ter mais um
-appservice de double puppeting administrado centralmente pelo servidor, como
-tinha a instalação anterior (`matrix_appservice_double_puppet_enabled` no
-`matrix-docker-ansible-deploy`).
+- O servidor só aceita isso para MXIDs listados no registration do slot; o
+  administrador libera cada pessoa com `playbooks/liberar-pontes.yml` (repo
+  agorae, ver `docs/ADICIONAR-PONTE.md`). Nada mais fica coberto: o slot age
+  como aquela pessoa e mais ninguém.
+- `bridgectl setup <ponte>` põe `agorae.dedyn.io: "as_token:${keyring:as_token}"`
+  em `double_puppet.secrets` (bridgev2) ou `bridge.login_shared_secret_map`
+  (discord) — reaproveita o `as_token` que já está no chaveiro — e o
+  `registration.yaml` que o metroon entrega já traz o namespace do dono.
+- Enquanto o administrador não liberou, `setup` avisa "aguardando liberação".
+  Sem o namespace no servidor a ponte funciona igual, só sem double puppeting.
+
+## Diagnóstico e backup
+
+```bash
+bridgectl doctor --all       # confere cada ponte: registration (msc4190/msc3202/namespace do dono),
+                             # hostname só na VPN, encryption, allow_key_sharing, log, segredos
+                             # em texto puro, arquivos antigos, versão fixada
+bridgectl backup --all       # copia os bancos (API de backup do SQLite, segura com a ponte rodando)
+```
+
+Os bancos concentram as chaves Megolm (perdê-los deixa as mensagens antigas
+ilegíveis para sempre) e as sessões. O `install.sh` instala e liga
+`mautrix-backup.timer` (diário, `Persistent`): copia para
+`~/.local/share/mautrix-bridges/backups/<ponte>/`, modo 0600 em diretório 0700,
+mantendo só as 3 mais novas (`--keep`). Os bancos vivos ficam em
+`~/.config/mautrix-bridges/<ponte>/`, junto do `config.yaml`.
+
+**Logs:** o padrão do exemplo é `logging.min_level: debug`, que grava no journal
+e em `logs/*.log` o corpo cifrado de cada mensagem e URLs completas. `setup`
+rebaixa `debug` para `info` (não mexe em quem já escolheu outro nível).
 
 ## Segurança e limitações
 
@@ -251,8 +278,11 @@ tinha a instalação anterior (`matrix_appservice_double_puppet_enabled` no
 ```
 bin/bridgectl                    o script (Python, só stdlib + python-keyring)
 systemd/mautrix-bridge@.service  unit template do systemd --user
+systemd/mautrix-backup.*         backup diário dos bancos (service + timer)
 config/bridges.toml.example      exemplo de configuração das pontes
-install.sh                       copia os três acima para os lugares certos
+install.sh                       copia os acima para os lugares certos e liga o timer de backup
+tests/test_bridgectl.py          testes das edições de config, do doctor, do backup e do harvest (pytest)
+docs/REVISAO-GERAL.md            revisão das pontes e do gestor: achados, riscos, recomendações
 docs/TESTING.md                  passo a passo pra validar tudo, testado na prática
 docs/SERVIDOR.md                 o que pedir ao administrador do servidor (peer WireGuard, registro da ponte)
 ```

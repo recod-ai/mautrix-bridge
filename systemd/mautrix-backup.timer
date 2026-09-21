@@ -1,0 +1,13 @@
+; ~/.config/systemd/user/mautrix-backup.timer
+;   systemctl --user enable --now mautrix-backup.timer
+[Unit]
+Description=Backup diário dos bancos das pontes mautrix
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+; se o notebook estava desligado na hora, roda assim que ligar
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -36,6 +36,14 @@ journalctl --user -u mautrix-bridge@<ponte> -f
 
 ## 3. Double puppeting (opcional, mas recomendado)
 
+> **Atualização:** com o MAS, o método abaixo (`login-matrix`) tem um limite
+> sério: o único token que você consegue copiar é o OAuth (`mat_…`), que vale
+> **5 minutos**. As pontes do pool (Discord, Slack, WhatsApp, Signal) usam agora
+> o **double puppeting automático pelo `as_token` do slot**: o administrador
+> libera você com `playbooks/liberar-pontes.yml` e o `bridgectl setup` cuida do
+> resto — ver o README ("Double puppeting automático"). O texto a seguir vale
+> só para pontes fora do pool.
+
 Sem isso, mensagens que você manda direto do WhatsApp/Slack aparecem no Matrix
 vindas de um "fantasma" (`@slack_você:seu-dominio`) em vez da sua conta de
 verdade. Duas formas — a manual não depende do administrador pra nada além

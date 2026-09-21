@@ -221,6 +221,7 @@ DEFAULTS = {
     "arch": ARCH_MAP.get(platform.machine(), "amd64"),
     "keyring_service": "",      # vazio => "mautrix-<nome da ponte>"
     "update_cooldown": 900,     # segundos entre checagens automáticas
+    "auto_update": True,        # False = reiniciar a ponte NÃO troca o binário (só 'bridgectl update <ponte>')
     "args": [],
 }
 
@@ -344,6 +345,12 @@ def cmd_update(cfg: dict, args: argparse.Namespace) -> int:
         st = read_state(name)
         target = BIN_DIR / b["binary"]
 
+        # O ExecStartPre da unit chama 'update --quiet' a cada (re)início. Com
+        # auto_update = false isso vira um no-op: a versão só muda quando você
+        # roda 'bridgectl update <ponte>' de propósito (sem --quiet).
+        if args.quiet and not b.get("auto_update", True) and target.exists():
+            continue
+
         if not args.force and target.exists():
             elapsed = time.time() - st.get("checked_at", 0)
             if elapsed < b["update_cooldown"]:
@@ -438,7 +445,13 @@ def cmd_set(cfg: dict, args: argparse.Namespace) -> int:
 HARVEST_KEYS = [
     "as_token", "hs_token", "login_shared_secret", "shared_secret",
     "uri", "pickle_key", "provisioning_shared_secret",
+    "signing_key", "server_key", "avatar_proxy_key",
 ]
+
+# Chaves de mídia/avatar: só o valor literal que já está no config vai pro
+# chaveiro. O sentinela `generate` fica como está (mídia direta/pública vem
+# desligada, e `server_key` tem formato próprio — um hex aleatório não serve).
+HARVEST_LITERAL_ONLY = {"signing_key", "server_key", "avatar_proxy_key"}
 
 
 def cmd_harvest(cfg: dict, args: argparse.Namespace) -> int:
@@ -466,6 +479,9 @@ def cmd_harvest(cfg: dict, args: argparse.Namespace) -> int:
             # real value in the keyring with that placeholder string.
             value = raw.strip('"').strip("'")
             if value.startswith("${keyring:") or value in {"null", "~", ""}:
+                out_lines.append(line)
+                continue
+            if value == "generate" and key in HARVEST_LITERAL_ONLY:
                 out_lines.append(line)
                 continue
             if value == "generate":
@@ -785,7 +801,7 @@ def cmd_vpn_init(cfg: dict, args: argparse.Namespace) -> int:
     default_token_shown = "(mantém o já gravado)" if existing_token else "(deixe em branco pra pular)"
     token = ask(
         f"Token de API do propylaia (mostrado em /propylaia, pra 'setup' buscar sozinho "
-        f"Discord/Slack/WhatsApp pré-registrados) {default_token_shown}"
+        f"Discord/Slack/WhatsApp/Signal pré-registrados) {default_token_shown}"
     )
 
     header("Confira antes de gravar")
@@ -1237,7 +1253,7 @@ DISPLAYNAME_TEMPLATES = {
 # the only option short of forking the bridge itself.
 DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack", "signal"}
 
-# End-to-end encryption, on by default for all three pool bridge types —
+# End-to-end encryption, on by default for all four pool bridge types —
 # Element already encrypts new private/DM rooms by default, and without this
 # the bridge simply can't take part in them ("End-to-end encryption isn't
 # enabled"). Confirmed against each bridge's real example-config.yaml:
@@ -1251,7 +1267,7 @@ DISABLE_UMBRELLA_SPACE = {"whatsapp", "slack", "signal"}
 # it itself (confirmed live: without this, every such portal showed
 # Element's "End-to-end encryption isn't enabled", with no way to turn it
 # on from inside the room). `appservice: true` (inside encryption) plus the
-# top-level `appservice.ephemeral_events: true` (shared by all three, and
+# top-level `appservice.ephemeral_events: true` (shared by all four, and
 # named the same as the boolean above purely by coincidence — they're
 # unrelated keys in unrelated sections) switch on MSC2409 to-device
 # delivery instead of plain /sync polling, which the docs recommend pairing
@@ -1263,7 +1279,7 @@ def apply_house_style(cfg_file: Path, bridge_type: str) -> list[str]:
     """Displayname suffix (whatsapp/discord/slack only — cosmetic, see
     DISPLAYNAME_TEMPLATES) + no umbrella space (whatsapp/slack only — same,
     see DISABLE_UMBRELLA_SPACE) + encryption/MSC4190 on for EVERY bridge that
-    actually ships an encryption: section (not just the three pool types —
+    actually ships an encryption: section (not just the pool types —
     this one isn't a cosmetic choice, it's a hard requirement of this
     homeserver's MAS-based auth, see the MSC4190 comment below; a non-pool
     bridge like signal needs it exactly as much as the pool ones do, and
@@ -1342,7 +1358,13 @@ def apply_house_style(cfg_file: Path, bridge_type: str) -> list[str]:
         section_text, n4 = re.subn(
             r"(?m)^(\s*)msc4190:\s*.*$", lambda m: f"{m.group(1)}msc4190: true", section_text, count=1,
         )
-        if n1 or n2 or n3 or n4:
+        # Com `cross-signed-tofu` (verification_levels.share), só dispositivos
+        # cross-signed conseguem pedir chaves antigas à ponte; `true` em todas
+        # as pontes evita "Unable to decrypt" em sessões novas do Element.
+        section_text, n5 = re.subn(
+            r"(?m)^([ \t]*)allow_key_sharing:[ \t]*false[ \t]*$", lambda m: f"{m.group(1)}allow_key_sharing: true", section_text, count=1,
+        )
+        if n1 or n2 or n3 or n4 or n5:
             text = text[:enc_start] + section_text + text[enc_end:]
             changed.append("encryption ligada")
 
@@ -1384,6 +1406,19 @@ def apply_house_style(cfg_file: Path, bridge_type: str) -> list[str]:
         if n:
             text = text[:bridge_span[0]] + section_text + text[bridge_span[1]:]
             changed.append("m.direct sync ligado")
+
+    # `debug` (o padrão do exemplo) grava no journal o corpo cifrado de cada
+    # mensagem e URLs completas; só rebaixa quem ainda está em debug.
+    log_span = _section_span(text, "logging")
+    if log_span:
+        section_text, n = re.subn(
+            r"(?m)^([ \t]*)min_level:[ \t]*debug[ \t]*$",
+            lambda m: f"{m.group(1)}min_level: info",
+            text[log_span[0]:log_span[1]], count=1,
+        )
+        if n:
+            text = text[:log_span[0]] + section_text + text[log_span[1]:]
+            changed.append("log em info")
 
     if text != before:
         cfg_file.write_text(text)
@@ -1571,7 +1606,10 @@ def apply_pool_config(cfg_file: Path, pool_slot: dict, server: dict) -> None:
 
     text = set_in_section(text, "appservice", "id", pool_slot["id"])
     text = set_in_section(text, "appservice", "address", pool_slot["url"])
-    text = set_in_section(text, "appservice", "hostname", "0.0.0.0")
+    # Escuta só no IP da VPN que a `url` do slot promete ao Synapse — em
+    # 0.0.0.0 a porta do appservice ficaria aberta também na Wi-Fi/LAN,
+    # protegida apenas pelo hs_token.
+    text = set_in_section(text, "appservice", "hostname", urlparse(pool_slot["url"]).hostname or "0.0.0.0")
     text = set_in_section(text, "appservice", "port", str(port))
     text = set_in_section(text, "appservice", "username", pool_slot["bot_username"])
     text = set_in_section(text, "appservice", "as_token", f'"{pool_slot["as_token"]}"')
@@ -1813,6 +1851,162 @@ def cmd_setup(cfg: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# backup e diagnóstico
+# --------------------------------------------------------------------------- #
+
+def bridge_databases(name: str) -> list[Path]:
+    """Bancos SQLite vivos da ponte (sem -wal/-shm nem cópias antigas)."""
+    found: list[Path] = []
+    for base in (CONFIG_DIR / name, DATA_DIR / name):
+        if base.is_dir():
+            found += [f for f in sorted(base.glob("*.db")) if ".bak" not in f.name]
+    return found
+
+
+def backup_database(src: Path, dest_dir: Path, name: str, keep: int) -> Path:
+    """Cópia consistente (API de backup do SQLite, segura com a ponte rodando e
+    com o -wal) em dest_dir, modo 0600; mantém só as `keep` mais novas."""
+    import datetime
+    import sqlite3
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest_dir, 0o700)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = dest_dir / f"{src.stem}-{stamp}.db"
+    source = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        target = sqlite3.connect(dest)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+    os.chmod(dest, 0o600)
+    old = sorted(dest_dir.glob(f"{src.stem}-*.db"))
+    for f in old[:-keep] if keep > 0 else []:
+        f.unlink()
+    return dest
+
+
+def cmd_backup(cfg: dict, args: argparse.Namespace) -> int:
+    """Os bancos concentram as chaves Megolm (perdê-los = mensagens antigas
+    ilegíveis para sempre) e as sessões do Slack/Discord/Signal em texto puro:
+    por isso ficam só em diretório 0700, e só as `--keep` mais recentes."""
+    names = list(cfg["bridges"]) if args.all else [args.name]
+    rc = 0
+    for name in names:
+        get_bridge(cfg, name)
+        dbs = bridge_databases(name)
+        if not dbs:
+            log(f"{name}: nenhum banco encontrado em {CONFIG_DIR / name} — nada a copiar")
+            continue
+        for db in dbs:
+            try:
+                dest = backup_database(db, DATA_DIR / "backups" / name, name, args.keep)
+            except Exception as e:  # noqa: BLE001 — um banco com problema não pode travar os outros
+                log(f"{name}: backup de {db.name} falhou ({e})")
+                rc = 1
+                continue
+            if not args.quiet:
+                log(f"{name}: {db.name} → {dest} ({dest.stat().st_size // 1024} KB)")
+    return rc
+
+
+def _value_in(text: str, section: str, key: str) -> str | None:
+    span = _section_span(text, section)
+    if not span:
+        return None
+    m = re.search(rf"(?m)^[ \t]*{re.escape(key)}:[ \t]*(.*?)[ \t]*$", text[span[0]:span[1]])
+    return m.group(1).strip("\"'") if m else None
+
+
+def doctor_checks(name: str, b: dict, server: dict, cfg_text: str, reg_text: str | None) -> list[tuple[str, str]]:
+    """Confere um config.yaml/registration.yaml contra o que este projeto espera
+    (ver docs/REVISAO-GERAL.md). Devolve [(nível, mensagem)] com nível ok/aviso/falha."""
+    out: list[tuple[str, str]] = []
+    ok = lambda m: out.append(("ok", m))
+    warn = lambda m: out.append(("aviso", m))
+    fail = lambda m: out.append(("falha", m))
+    pool = b["repo"] in POOL_BRIDGE_TYPES
+    domain = server.get("homeserver_domain")
+    vpn_ip = server.get("vpn_ip")
+    owner = server.get("owner_mxid")
+
+    if reg_text is None:
+        fail("registration.yaml não existe")
+    else:
+        missing = [f for f in ("io.element.msc4190", "org.matrix.msc3202", "receive_ephemeral") if f"{f}: true" not in reg_text]
+        (fail if missing else ok)(f"registration.yaml sem {', '.join(missing)}" if missing else "registration.yaml declara msc4190, msc3202 e receive_ephemeral")
+        if pool and owner:
+            esc = owner.replace(".", "\\.")
+            has = re.search(rf"exclusive:\s*false\s*\n\s*regex:\s*'{re.escape(esc)}'", reg_text) is not None
+            (ok if has else warn)("namespace do dono no registration (double puppeting)" if has
+                                  else f"registration.yaml sem o namespace de {owner} — sem double puppeting até o admin liberar")
+
+    hostname = _value_in(cfg_text, "appservice", "hostname")
+    if vpn_ip and hostname == vpn_ip:
+        ok(f"appservice.hostname = {vpn_ip} (só na VPN)")
+    elif hostname:
+        warn(f"appservice.hostname = {hostname}: a porta do appservice fica aberta além da VPN ({vpn_ip or 'IP da VPN não configurado'})")
+
+    enc = _encryption_span(cfg_text, b["repo"])
+    if enc is None:
+        warn("sem seção de encryption no config")
+    else:
+        enc_text = cfg_text[enc[0]:enc[1]]
+        off = [k for k in ("allow", "appservice", "default", "msc4190") if not re.search(rf"(?m)^\s*{k}:\s*true\s*$", enc_text)]
+        (fail if off else ok)(f"encryption: {', '.join(off)} não está true" if off else "encryption ligada (allow/appservice/default/msc4190)")
+        (ok if re.search(r"(?m)^\s*allow_key_sharing:\s*true\s*$", enc_text) else warn)(
+            "allow_key_sharing = true" if re.search(r"(?m)^\s*allow_key_sharing:\s*true\s*$", enc_text)
+            else "allow_key_sharing não é true (sessões novas do Element não recebem chaves antigas)")
+
+    level = _value_in(cfg_text, "logging", "min_level")
+    (warn if level == "debug" else ok)("logging.min_level = debug (grava conteúdo demais no journal)" if level == "debug"
+                                       else f"logging.min_level = {level or 'padrão'}")
+
+    if pool and owner:
+        has_secret = f'{domain}: "as_token:${{keyring:as_token}}"' in cfg_text
+        (ok if has_secret else warn)("double puppeting automático configurado (as_token do slot)" if has_secret
+                                     else "double puppeting automático não configurado no config.yaml")
+    if domain and f'"{domain}": user' in cfg_text:
+        warn(f'bridge.permissions libera "{domain}": user (todo o domínio, não só o dono)')
+
+    plain = [k for k in ("as_token", "hs_token", "pickle_key", "signing_key", "server_key")
+             if re.search(rf"(?m)^\s*{k}:\s*[\"']?(?!\$\{{keyring:|generate)[^\s\"']", cfg_text)]
+    (warn if plain else ok)(f"segredos em texto puro no config.yaml: {', '.join(plain)}" if plain else "sem segredos em texto puro no config.yaml")
+
+    if b.get("auto_update", True):
+        warn(f"auto_update ligado (canal {b['channel']}): reiniciar a ponte pode trocar o binário")
+    else:
+        ok("versão fixada (auto_update = false)")
+    return out
+
+
+def cmd_doctor(cfg: dict, args: argparse.Namespace) -> int:
+    names = list(cfg["bridges"]) if args.all or not args.name else [args.name]
+    worst = 0
+    for name in names:
+        b = get_bridge(cfg, name)
+        src = CONFIG_DIR / name
+        cfg_file, reg_file = src / "config.yaml", src / "registration.yaml"
+        header(name)
+        if not cfg_file.exists():
+            print("  falha  config.yaml não existe — rode 'bridgectl setup'")
+            worst = max(worst, 2)
+            continue
+        results = doctor_checks(name, b, cfg.get("server", {}), cfg_file.read_text(),
+                                reg_file.read_text() if reg_file.exists() else None)
+        leftovers = [f.name for f in (list(src.glob("*.orig")) + list(src.glob("*.bak*"))) if f.is_file()]
+        if leftovers:
+            results.append(("aviso", f"arquivos antigos que podem ter segredos: {', '.join(sorted(leftovers))}"))
+        for level, msg in results:
+            print(f"  {level:<5}  {msg}")
+            worst = max(worst, {"ok": 0, "aviso": 1, "falha": 2}[level])
+    print()
+    return 1 if worst == 2 else 0
+
+
 def cmd_status(cfg: dict, args: argparse.Namespace) -> int:
     def secrets_ok(b: dict) -> str:
         probe = b.get("keyring_probe", "as_token")
@@ -1897,8 +2091,20 @@ def main() -> int:
 
     sub.add_parser("status", help="mostra versões instaladas").set_defaults(func=cmd_status)
 
+    bk = sub.add_parser("backup", help="copia os bancos SQLite da ponte (consistente, modo 0600) e guarda só as mais recentes")
+    bk.add_argument("name", nargs="?")
+    bk.add_argument("--all", action="store_true")
+    bk.add_argument("--keep", type=int, default=3, help="quantas cópias manter por banco (default 3)")
+    bk.add_argument("--quiet", action="store_true")
+    bk.set_defaults(func=cmd_backup)
+
+    dc = sub.add_parser("doctor", help="confere config/registration de cada ponte contra o esperado (hostname, encryption, log, segredos...)")
+    dc.add_argument("name", nargs="?")
+    dc.add_argument("--all", action="store_true")
+    dc.set_defaults(func=cmd_doctor)
+
     args = p.parse_args()
-    if getattr(args, "func", None) is cmd_update and not args.all and not args.name:
+    if getattr(args, "func", None) in (cmd_update, cmd_backup) and not args.all and not args.name:
         die("informe o nome da ponte ou use --all")
 
     cfg = load_config()
